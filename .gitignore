@@ -1,0 +1,18 @@
+# Ignorar archivos de entorno
+.env
+
+# Node modules
+node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Directorios de producción
+dist/
+build/
+
+# Archivos del sistema (Windows, macOS)
+.DS_Store
+Thumbs.db
