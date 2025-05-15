@@ -8,7 +8,7 @@ const ccxt = require('ccxt')
 const { EMA, RSI } = require('technicalindicators')
 
 const app = express()
-const port = 3000
+const port = process.env.PORT || 3000;
 
 const discordWebHook = process.env.DISCORD_WEBHOOK_URL
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN
@@ -166,6 +166,6 @@ app.get('/', (req, res) => {
 })
 
 app.listen(port, () => {
-    console.log(`Servidor corriendo en http://localhost:${port}`)
+    console.log(`Servidor corriendo en ${port}`)
     monitorTokens()
 })
