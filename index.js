@@ -10,7 +10,6 @@ const fs = require('fs').promises
 const app = express()
 const port = process.env.PORT || 3000
 
-const discordWebHook = process.env.DISCORD_WEBHOOK_URL
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN
 const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
@@ -141,77 +140,6 @@ function calculateIndicators(ohlcv) {
     }
 }
 
-async function sendDiscordAlert(message) {
-    if (!discordWebHook) {
-        logEvent('WARN', 'URL de webhook de Discord no configurada')
-        return { success: false, error: 'Webhook no configurado' }
-    }
-
-    const MAX_RETRIES = 3
-
-    for (let retry = 0; retry < MAX_RETRIES; retry++) {
-        try {
-            logEvent('DEBUG', `Intento ${retry + 1}/${MAX_RETRIES} de enviar alerta a Discord`)
-            const testResponse = await axios.get(discordWebHook.split('?')[0], {
-                timeout: 5000,
-                validateStatus: function (status) {
-                    return status < 500
-                }
-            })
-
-            if (testResponse.status !== 200) {
-                logEvent('WARN', 'Problema con el webhook de Discord', {
-                    statusCode: testResponse.status,
-                    statusText: testResponse.statusText
-                })
-            }
-
-            const response = await axios.post(discordWebHook, {
-                content: `${message}\n\n_Bot time: ${new Date().toISOString()}_`
-            }, {
-                timeout: 5000,
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            })
-
-            if (response.status === 204 || response.status === 200) {
-                logEvent('INFO', 'Alerta enviada a Discord con éxito')
-                botStats.lastSuccessfulAlert = new Date()
-                return { success: true }
-            } else {
-                logEvent('WARN', `Discord respondió con código ${response.status}`, {
-                    statusCode: response.status,
-                    statusText: response.statusText
-                })
-            }
-        } catch (error) {
-            const errorDetails = {
-                retry: retry + 1,
-                error: error.message,
-                response: error.response ? {
-                    status: error.response.status,
-                    headers: error.response.headers,
-                    data: error.response.data
-                } : 'No response data'
-            }
-
-            logEvent('ERROR', `Error al enviar mensaje a Discord (intento ${retry + 1}/${MAX_RETRIES})`, errorDetails)
-
-            if (error.response && (error.response.status === 429 || error.response.status === 502)) {
-                const retryAfter = error.response.headers['retry-after'] || 5
-                logEvent('INFO', `Esperando ${retryAfter}s antes de reintentar (Discord)`)
-                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
-            } else {
-                await new Promise(resolve => setTimeout(resolve, 2000))
-            }
-        }
-    }
-
-    logEvent('ERROR', `Falló el envío a Discord después de ${MAX_RETRIES} intentos`)
-    return { success: false, error: `Falló después de ${MAX_RETRIES} intentos` }
-}
-
 async function sendTelegramAlert(message) {
     if (!telegramBotToken || !telegramChatId) {
         logEvent('WARN', 'Configuración de Telegram incompleta')
@@ -239,7 +167,6 @@ async function sendTelegramAlert(message) {
                 await new Promise(resolve => setTimeout(resolve, 5000))
                 continue
             }
-
 
             const response = await axios.post(
                 `https://api.telegram.org/bot${telegramBotToken}/sendMessage`,
@@ -294,12 +221,9 @@ async function sendTestMessages() {
     logEvent('INFO', 'Enviando mensajes de prueba...')
 
     const message = `🧪 *TEST ALERT* 🧪\nEste es un mensaje de prueba para verificar la configuración.\nHora del servidor: ${new Date().toISOString()}`
-
-    const discordResult = await sendDiscordAlert(message + '\n\n_Enviado a Discord_')
     const telegramResult = await sendTelegramAlert(message + '\n\n_Enviado a Telegram_')
 
     return {
-        discord: discordResult,
         telegram: telegramResult,
         time: new Date().toISOString()
     }
@@ -369,18 +293,7 @@ async function analyzeAndAlert(symbol) {
 
             try {
                 logEvent('INFO', `Enviando alertas para ${symbol}...`)
-                const discordResult = await sendDiscordAlert(message)
-                await new Promise(resolve => setTimeout(resolve, 2000))
                 const telegramResult = await sendTelegramAlert(message)
-
-                const discordSent = discordResult.success
-                const telegramSent = telegramResult.success
-
-                if (discordSent) {
-                    logEvent('INFO', `✅ Alerta enviada a Discord para ${symbol}`)
-                } else {
-                    logEvent('WARN', `❌ Error al enviar alerta a Discord para ${symbol}`, { error: discordResult.error })
-                }
 
                 if (telegramSent) {
                     logEvent('INFO', `✅ Alerta enviada a Telegram para ${symbol}`)
@@ -388,7 +301,7 @@ async function analyzeAndAlert(symbol) {
                     logEvent('WARN', `❌ Error al enviar alerta a Telegram para ${symbol}`, { error: telegramResult.error })
                 }
 
-                if (discordSent || telegramSent) {
+                if (telegramResult.success) {
                     botStats.totalAlertsSent++
                     currentState.lastAlert = Date.now()
                     tokenStates.set(symbol, currentState)
