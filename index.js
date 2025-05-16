@@ -5,6 +5,7 @@ const express = require('express')
 const axios = require('axios')
 const ccxt = require('ccxt')
 const ti = require('technicalindicators')
+const fs = require('fs').promises
 
 const app = express()
 const port = process.env.PORT || 3000
@@ -15,24 +16,77 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
 const kucoin = new ccxt.kucoin({
     enableRateLimit: true,
-    rateLimit: 1000,
+    rateLimit: 1000, // 1 segundo entre llamadas
 })
 
 const tokenStates = new Map()
 
 let isMonitoringActive = false
 
+const botStats = {
+    startTime: new Date(),
+    cyclesCompleted: 0,
+    totalAlertsTriggered: 0,
+    totalAlertsSent: 0,
+    failedAlerts: 0,
+    lastSuccessfulAlert: null,
+    errors: []
+}
+
+const LOG_FILE = '/tmp/crypto-bot-logs.json'
+
+async function saveLog(data) {
+    try {
+        let logs = []
+        try {
+            const existingData = await fs.readFile(LOG_FILE, 'utf8')
+            logs = JSON.parse(existingData)
+            if (logs.length >= 100) logs = logs.slice(-99)
+        } catch (err) {
+            logs = []
+        }
+
+        logs.push({
+            timestamp: new Date().toISOString(),
+            ...data
+        })
+
+        await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2))
+    } catch (err) {
+        console.error('Error guardando logs:', err.message)
+    }
+}
+
+function logEvent(type, message, data = {}) {
+    const logData = { type, message, ...data }
+    console.log(`[${new Date().toISOString()}] [${type}] ${message}`)
+    saveLog(logData)
+
+    if (type === 'ERROR') {
+        botStats.errors.push({
+            time: new Date().toISOString(),
+            message,
+            ...data
+        })
+
+        if (botStats.errors.length > 20) {
+            botStats.errors.shift()
+        }
+    }
+}
+
 async function getLeverageTokens() {
     try {
         const markets = await kucoin.loadMarkets()
+
         const leverageTokens = Object.keys(markets).filter(symbol => {
             return /[0-9]+[LS]\/USDT$/.test(symbol)
         })
 
-        console.log(`Tokens apalancados encontrados: ${leverageTokens.length}`)
+        logEvent('INFO', `Tokens apalancados encontrados: ${leverageTokens.length}`)
         return leverageTokens
     } catch (error) {
-        console.error('Error al cargar los mercados de KuCoin:', error.message)
+        logEvent('ERROR', 'Error al cargar los mercados de KuCoin', { error: error.message })
         return []
     }
 }
@@ -40,22 +94,23 @@ async function getLeverageTokens() {
 async function fetchOHLCVData(symbol, timeframe = '15m', limit = 100) {
     try {
         const ohlcv = await kucoin.fetchOHLCV(symbol, timeframe, undefined, limit)
-
+        
         if (!ohlcv || ohlcv.length < 21) {
-            console.log(`No hay suficientes datos para ${symbol}`)
+            logEvent('WARN', `No hay suficientes datos para ${symbol}`)
             return null
         }
-
+        
         return ohlcv
     } catch (error) {
-        console.error(`Error al obtener datos OHLCV para ${symbol}:`, error.message)
+        logEvent('ERROR', `Error al obtener datos OHLCV para ${symbol}`, { error: error.message })
         return null
     }
 }
 
+
 function calculateIndicators(ohlcv) {
     if (!ohlcv || ohlcv.length < 21) return null
-
+    
     const close = ohlcv.map(candle => candle[4])
     const volume = ohlcv.map(candle => candle[5])
 
@@ -68,7 +123,7 @@ function calculateIndicators(ohlcv) {
         const volumeAvg = ti.SMA.calculate({ period: 20, values: volume })
 
         if (ema9.length === 0 || ema21.length === 0 || rsi.length === 0 || volumeAvg.length === 0) {
-            console.log(`Cálculo de indicadores falló para algún indicador`)
+            logEvent('WARN', `Cálculo de indicadores falló para algún indicador`)
             return null
         }
 
@@ -81,100 +136,217 @@ function calculateIndicators(ohlcv) {
             volumeAvg: volumeAvg[volumeAvg.length - 1]
         }
     } catch (error) {
-        console.error('Error al calcular indicadores:', error.message)
+        logEvent('ERROR', 'Error al calcular indicadores', { error: error.message })
         return null
     }
 }
 
 async function sendDiscordAlert(message) {
     if (!discordWebHook) {
-        console.log('URL de webhook de Discord no configurada')
-        return
+        logEvent('WARN', 'URL de webhook de Discord no configurada')
+        return { success: false, error: 'Webhook no configurado' }
     }
+    
+    const MAX_RETRIES = 3
+    
+    for (let retry = 0; retry < MAX_RETRIES; retry++) {
+        try {
+            logEvent('DEBUG', `Intento ${retry + 1}/${MAX_RETRIES} de enviar alerta a Discord`)
+            const testResponse = await axios.get(discordWebHook.split('?')[0], { 
+                timeout: 5000,
+                validateStatus: function (status) {
+                    return status < 500 
+                }
+            })
 
-    try {
-        const response = await axios.post(discordWebHook, { content: message }, { timeout: 5000 })
-        console.log('Alerta enviada a Discord con éxito')
-        return response
-    } catch (error) {
-        console.error('Error al enviar mensaje a Discord:', error.message)
-        throw error
+            if (testResponse.status !== 200) {
+                logEvent('WARN', 'Problema con el webhook de Discord', { 
+                    statusCode: testResponse.status, 
+                    statusText: testResponse.statusText 
+                })
+            }
+
+            const response = await axios.post(discordWebHook, { 
+                content: `${message}\n\n_Bot time: ${new Date().toISOString()}_` 
+            }, { 
+                timeout: 5000,
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+            
+            if (response.status === 204 || response.status === 200) {
+                logEvent('INFO', 'Alerta enviada a Discord con éxito')
+                botStats.lastSuccessfulAlert = new Date()
+                return { success: true }
+            } else {
+                logEvent('WARN', `Discord respondió con código ${response.status}`, {
+                    statusCode: response.status,
+                    statusText: response.statusText
+                })
+            }
+        } catch (error) {
+            const errorDetails = {
+                retry: retry + 1,
+                error: error.message,
+                response: error.response ? {
+                    status: error.response.status,
+                    headers: error.response.headers,
+                    data: error.response.data
+                } : 'No response data'
+            }
+
+            logEvent('ERROR', `Error al enviar mensaje a Discord (intento ${retry + 1}/${MAX_RETRIES})`, errorDetails)
+
+            if (error.response && (error.response.status === 429 || error.response.status === 502)) {
+                const retryAfter = error.response.headers['retry-after'] || 5
+                logEvent('INFO', `Esperando ${retryAfter}s antes de reintentar (Discord)`)
+                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 2000))
+            }
+        }
     }
+    
+    logEvent('ERROR', `Falló el envío a Discord después de ${MAX_RETRIES} intentos`)
+    return { success: false, error: `Falló después de ${MAX_RETRIES} intentos` }
 }
 
 async function sendTelegramAlert(message) {
     if (!telegramBotToken || !telegramChatId) {
-        console.log('Configuración de Telegram incompleta')
-        return
+        logEvent('WARN', 'Configuración de Telegram incompleta')
+        return { success: false, error: 'Configuración incompleta' }
     }
-
+    
     const MAX_RETRIES = 3
-    let retries = 0
-
-    while (retries < MAX_RETRIES) {
+    
+    for (let retry = 0; retry < MAX_RETRIES; retry++) {
         try {
+            logEvent('DEBUG', `Intento ${retry + 1}/${MAX_RETRIES} de enviar alerta a Telegram`)
+
+            const botCheckUrl = `https://api.telegram.org/bot${telegramBotToken}/getMe`
+            try {
+                await axios.get(botCheckUrl, { timeout: 5000 })
+            } catch (checkErr) {
+                logEvent('ERROR', 'El bot de Telegram parece no estar activo', {
+                    error: checkErr.message,
+                    response: checkErr.response ? {
+                        status: checkErr.response.status,
+                        data: checkErr.response.data
+                    } : 'No response'
+                })
+
+                await new Promise(resolve => setTimeout(resolve, 5000))
+                continue
+            }
+            
+
             const response = await axios.post(
                 `https://api.telegram.org/bot${telegramBotToken}/sendMessage`,
                 {
                     chat_id: telegramChatId,
-                    text: message,
+                    text: `${message}\n\n_Bot time: ${new Date().toISOString()}_`,
                     parse_mode: 'Markdown'
                 },
-                { timeout: 5000 }
+                { timeout: 8000 }
             )
 
-            console.log('Alerta enviada a Telegram con éxito')
-            await new Promise(resolve => setTimeout(resolve, 3000))
-            return response.data
+            if (response.data && response.data.ok) {
+                logEvent('INFO', 'Alerta enviada a Telegram con éxito')
+                botStats.lastSuccessfulAlert = new Date()
+                return { success: true }
+            } else {
+                logEvent('WARN', 'Telegram respondió sin confirmar éxito', {
+                    response: response.data
+                })
+            }
 
         } catch (error) {
-            retries++
+            const errorDetails = {
+                retry: retry + 1,
+                error: error.message,
+                response: error.response ? {
+                    status: error.response.status,
+                    data: error.response.data
+                } : 'No response data'
+            }
+
+            logEvent('ERROR', `Error al enviar mensaje a Telegram (intento ${retry + 1}/${MAX_RETRIES})`, errorDetails)
 
             if (error.response?.status === 429) {
                 const retryAfter = error.response.headers['retry-after'] || 10
-                console.log(`Rate limit alcanzado. Reintento ${retries}/${MAX_RETRIES} en ${retryAfter}s`)
+                logEvent('INFO', `Rate limit alcanzado. Esperando ${retryAfter}s antes de reintentar (Telegram)`)
                 await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
+            } else if (error.response?.status === 400 && error.response?.data?.description?.includes('chat not found')) {
+                logEvent('ERROR', 'El chat_id de Telegram es incorrecto', { chatId: telegramChatId })
+                return { success: false, error: 'Chat ID incorrecto' }
             } else {
-                console.error(`Error en Telegram (${error.message}). Intento ${retries}/${MAX_RETRIES}`)
                 await new Promise(resolve => setTimeout(resolve, 5000))
             }
         }
     }
+    
+    logEvent('ERROR', `Falló el envío a Telegram después de ${MAX_RETRIES} intentos`)
+    return { success: false, error: `Falló después de ${MAX_RETRIES} intentos` }
+}
 
-    throw new Error(`Falló el envío a Telegram después de ${MAX_RETRIES} intentos`)
+async function sendTestMessages() {
+    logEvent('INFO', 'Enviando mensajes de prueba...')
+    
+    const message = `🧪 *TEST ALERT* 🧪\nEste es un mensaje de prueba para verificar la configuración.\nHora del servidor: ${new Date().toISOString()}`
+    
+    const discordResult = await sendDiscordAlert(message + '\n\n_Enviado a Discord_')
+    const telegramResult = await sendTelegramAlert(message + '\n\n_Enviado a Telegram_')
+    
+    return {
+        discord: discordResult,
+        telegram: telegramResult,
+        time: new Date().toISOString()
+    }
 }
 
 async function analyzeAndAlert(symbol) {
     try {
-        console.log(`Analizando ${symbol}...`)
+        logEvent('DEBUG', `Analizando ${symbol}...`)
         const ohlcv = await fetchOHLCVData(symbol)
-
         if (!ohlcv) return false
 
         const indicators = calculateIndicators(ohlcv)
-
         if (!indicators) return false
-
+        
         const lastRsi = indicators.rsi
-        const lastState = tokenStates.get(symbol) || { sobrecompra: false, sobrevendido: false, lastAlert: 0 }
+
+        const lastState = tokenStates.get(symbol) || { 
+            sobrecompra: false, 
+            sobrevendido: false, 
+            lastAlert: 0,
+            lastCheck: 0,
+            rsi: null
+        }
+
         const currentState = {
             sobrecompra: lastRsi > 70,
             sobrevendido: lastRsi < 30,
-            lastAlert: lastState.lastAlert
+            lastAlert: lastState.lastAlert,
+            lastCheck: Date.now(),
+            rsi: lastRsi
         }
 
-        console.log(`[ANÁLISIS] ${symbol} - RSI: ${lastRsi.toFixed(2)} | Estado: ${currentState.sobrecompra ? 'SOBRECOMPRA' :
-                currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
+        logEvent('INFO', `[ANÁLISIS] ${symbol} - RSI: ${lastRsi.toFixed(2)} | Estado: ${
+            currentState.sobrecompra ? 'SOBRECOMPRA' : 
+            currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
 
         const tiempoDesdeUltimaAlerta = Date.now() - lastState.lastAlert
-        const debemosEnviarAlerta =
-            (currentState.sobrecompra && !lastState.sobrecompra) ||
+        const MIN_TIME_BETWEEN_ALERTS = 15 * 60 * 1000 
+        
+        const debemosEnviarAlerta = 
+            (currentState.sobrecompra && !lastState.sobrecompra) || 
             (currentState.sobrevendido && !lastState.sobrevendido) ||
-            ((currentState.sobrecompra === lastState.sobrecompra ||
-                currentState.sobrevendido === lastState.sobrevendido) &&
-                tiempoDesdeUltimaAlerta > 15 * 60 * 1000)
+            ((currentState.sobrecompra || currentState.sobrevendido) && 
+             tiempoDesdeUltimaAlerta > MIN_TIME_BETWEEN_ALERTS)
 
         if (debemosEnviarAlerta) {
+            botStats.totalAlertsTriggered++
             let condition, recommendation, emoji
 
             if (currentState.sobrecompra) {
@@ -186,7 +358,7 @@ async function analyzeAndAlert(symbol) {
                 recommendation = "Considerar **COMPRAR**"
                 emoji = "📈"
             } else {
-                return false
+                return false 
             }
 
             const message = `${emoji} *${symbol}* | ${condition}\n`
@@ -197,80 +369,113 @@ async function analyzeAndAlert(symbol) {
                 + `\n${recommendation}`
 
             try {
-                console.log(`Enviando alertas para ${symbol}...`)
-                const results = await Promise.allSettled([
-                    sendDiscordAlert(message),
-                    sendTelegramAlert(message)
-                ])
+                logEvent('INFO', `Enviando alertas para ${symbol}...`)
+                const discordResult = await sendDiscordAlert(message)
+                await new Promise(resolve => setTimeout(resolve, 2000))
+                const telegramResult = await sendTelegramAlert(message)
+                
+                const discordSent = discordResult.success
+                const telegramSent = telegramResult.success
 
-                results.forEach((result, index) => {
-                    const platform = index === 0 ? 'Discord' : 'Telegram'
-                    if (result.status === 'fulfilled') {
-                        console.log(`✅ Alerta enviada a ${platform} para ${symbol}`)
-                    } else {
-                        console.error(`❌ Error al enviar alerta a ${platform} para ${symbol}: ${result.reason}`)
-                    }
-                })
+                if (discordSent) {
+                    logEvent('INFO', `✅ Alerta enviada a Discord para ${symbol}`)
+                } else {
+                    logEvent('WARN', `❌ Error al enviar alerta a Discord para ${symbol}`, { error: discordResult.error })
+                }
 
-                if (results.some(r => r.status === 'fulfilled')) {
+                if (telegramSent) {
+                    logEvent('INFO', `✅ Alerta enviada a Telegram para ${symbol}`)
+                } else {
+                    logEvent('WARN', `❌ Error al enviar alerta a Telegram para ${symbol}`, { error: telegramResult.error })
+                }
+
+                if (discordSent || telegramSent) {
+                    botStats.totalAlertsSent++
                     currentState.lastAlert = Date.now()
                     tokenStates.set(symbol, currentState)
                     return true
+                } else {
+                    botStats.failedAlerts++
+                    tokenStates.set(symbol, {
+                        ...currentState,
+                        lastAlert: lastState.lastAlert // Mantenemos la última alerta anterior
+                    })
                 }
             } catch (error) {
-                console.error(`Error general enviando alertas para ${symbol}:`, error.message)
+                logEvent('ERROR', `Error general enviando alertas para ${symbol}`, { error: error.message })
+                botStats.failedAlerts++
             }
         } else {
             tokenStates.set(symbol, currentState)
         }
     } catch (err) {
-        console.error(`Error analizando ${symbol}:`, err.message)
+        logEvent('ERROR', `Error analizando ${symbol}`, { error: err.message })
     }
-
+    
     return false
 }
 
 async function monitorTokens() {
-    if (!isMonitoringActive) return
-
+    if (!isMonitoringActive) {
+        logEvent('WARN', 'Se intentó ejecutar monitorTokens() pero la monitorización está desactivada')
+        return
+    }
+    
     try {
-        console.log(`[${new Date().toISOString()}] Iniciando ciclo de monitoreo...`)
-        const symbols = await getLeverageTokens()
+        logEvent('INFO', `Iniciando ciclo de monitoreo #${botStats.cyclesCompleted + 1}...`)
 
+        const symbols = await getLeverageTokens()
+        
         if (!symbols || symbols.length === 0) {
-            console.log('No se encontraron tokens para monitorizar')
+            logEvent('WARN', 'No se encontraron tokens para monitorizar')
             return
         }
 
         let alertasSent = 0
 
         for (const symbol of symbols) {
+            if (!isMonitoringActive) {
+                logEvent('WARN', 'Monitorización detenida durante el ciclo. Abortando.')
+                break
+            }
+
             const alertaSent = await analyzeAndAlert(symbol)
+
             if (alertaSent) alertasSent++
 
             await new Promise(resolve => setTimeout(resolve, 5000))
         }
+        
 
-        console.log(`[${new Date().toISOString()}] Ciclo completado. ${alertasSent} alertas enviadas. Próximo ciclo en 5 minutos...`)
+        botStats.cyclesCompleted++
+        logEvent('INFO', `Ciclo #${botStats.cyclesCompleted} completado. ${alertasSent} alertas enviadas. Próximo ciclo en 5 minutos...`)
     } catch (error) {
-        console.error('Error en el ciclo de monitorización:', error)
+        logEvent('ERROR', 'Error en el ciclo de monitorización', { error: error.message })
     } finally {
         if (isMonitoringActive) {
             setTimeout(monitorTokens, 5 * 60 * 1000)
+        } else {
+            logEvent('WARN', 'No se programó el siguiente ciclo porque la monitorización está desactivada')
         }
     }
 }
 
 async function testKucoinAPI() {
     try {
-        const res = await axios.get('https://api.kucoin.com/api/v3/currencies')
-        console.log(`Conexión exitosa con KuCoin: ${res.data.data.length} monedas disponibles`)
+        const startTime = Date.now()
+        const res = await axios.get('https://api.kucoin.com/api/v3/currencies', { timeout: 10000 })
+        const endTime = Date.now()
+        const responseTime = endTime - startTime
+
+        logEvent('INFO', `Conexión exitosa con KuCoin: ${res.data.data.length} monedas disponibles (${responseTime}ms)`)
         return true
     } catch (error) {
-        console.error('Error al conectar con KuCoin:', error.message)
+        logEvent('ERROR', 'Error al conectar con KuCoin', { error: error.message })
         return false
     }
 }
+
+app.use(express.json()) 
 
 app.get('/', (req, res) => {
     const status = isMonitoringActive ? 'activo' : 'inactivo'
@@ -281,27 +486,95 @@ app.get('/status', (req, res) => {
     const status = {
         isMonitoring: isMonitoringActive,
         tokenCount: tokenStates.size,
-        startTime: new Date().toISOString()
+        startTime: botStats.startTime,
+        uptime: Math.floor((Date.now() - botStats.startTime) / (1000 * 60)), 
+        cyclesCompleted: botStats.cyclesCompleted,
+        totalAlertsTriggered: botStats.totalAlertsTriggered,
+        totalAlertsSent: botStats.totalAlertsSent,
+        failedAlerts: botStats.failedAlerts,
+        lastSuccessfulAlert: botStats.lastSuccessfulAlert,
+        tokens: [...tokenStates].map(([symbol, state]) => ({
+            symbol,
+            rsi: state.rsi,
+            sobrecompra: state.sobrecompra,
+            sobrevendido: state.sobrevendido,
+            lastAlertTime: state.lastAlert ? new Date(state.lastAlert).toISOString() : null
+        })).slice(0, 20), 
+        recentErrors: botStats.errors.slice(-5) 
     }
     res.json(status)
 })
 
+app.get('/logs', async (req, res) => {
+    try {
+        const data = await fs.readFile(LOG_FILE, 'utf8')
+        const logs = JSON.parse(data)
+        res.json(logs)
+    } catch (err) {
+        res.status(500).json({ error: 'Error leyendo logs', details: err.message })
+    }
+})
+
+app.post('/test-alerts', async (req, res) => {
+    try {
+        const results = await sendTestMessages()
+        res.json(results)
+    } catch (err) {
+        res.status(500).json({ error: 'Error enviando mensajes de prueba', details: err.message })
+    }
+})
+
+app.post('/restart', (req, res) => {
+    try {
+        isMonitoringActive = false
+        logEvent('INFO', 'Deteniendo monitorización para reinicio...')
+
+        tokenStates.clear()
+
+        botStats.cyclesCompleted = 0
+        botStats.totalAlertsTriggered = 0
+        botStats.totalAlertsSent = 0
+        botStats.failedAlerts = 0
+        botStats.lastSuccessfulAlert = null
+        botStats.errors = []
+        botStats.startTime = new Date()
+
+        setTimeout(() => {
+            logEvent('INFO', 'Reiniciando monitorización...')
+            isMonitoringActive = true
+            monitorTokens()
+            sendTestMessages()
+        }, 5000)
+        
+        res.json({ success: true, message: 'Bot reiniciando, la monitorización se reactivará en 5 segundos' })
+        
+    } catch (err) {
+        res.status(500).json({ error: 'Error reiniciando el bot', details: err.message })
+    }
+})
+
 app.listen(port, async () => {
     console.log(`Servidor corriendo en puerto ${port}`)
-
     const apiWorks = await testKucoinAPI()
-
+    
     if (apiWorks && !isMonitoringActive) {
         isMonitoringActive = true
-        console.log('Iniciando monitorización de tokens...')
+        logEvent('INFO', 'Iniciando monitorización de tokens...')
+
+        try {
+            await sendTestMessages()
+        } catch (error) {
+            logEvent('ERROR', 'Error enviando mensajes de prueba al inicio', { error: error.message })
+        }
+
         monitorTokens()
     } else if (!apiWorks) {
-        console.error('No se pudo iniciar la monitorización debido a problemas con la API de KuCoin')
+        logEvent('ERROR', 'No se pudo iniciar la monitorización debido a problemas con la API de KuCoin')
     }
 })
 
 process.on('SIGTERM', () => {
-    console.log('Señal SIGTERM recibida, deteniendo monitorización')
+    logEvent('INFO', 'Señal SIGTERM recibida, deteniendo monitorización')
     isMonitoringActive = false
     setTimeout(() => {
         process.exit(0)
@@ -309,7 +582,7 @@ process.on('SIGTERM', () => {
 })
 
 process.on('SIGINT', () => {
-    console.log('Señal SIGINT recibida, deteniendo monitorización')
+    logEvent('INFO', 'Señal SIGINT recibida, deteniendo monitorización')
     isMonitoringActive = false
     setTimeout(() => {
         process.exit(0)
