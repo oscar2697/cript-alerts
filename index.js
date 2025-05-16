@@ -18,6 +18,8 @@ const kucoin = new ccxt.kucoin({
     enableRateLimit: true,
 })
 
+const tokenStates = new Map()
+
 async function getLeverageTokens() {
     try {
         const markets = await kucoin.loadMarkets()
@@ -82,46 +84,71 @@ async function sendDiscordAlert(message) {
 }
 
 async function sendTelegramAlert(message) {
-    try {
-        await axios.post(`https://api.telegram.org/bot${telegramBotToken}/sendMessage`, {
-            chat_id: telegramChatId,
-            text: message,
-            parse_mode: 'Markdown'
-        })
-        await new Promise(resolve => setTimeout(resolve, 1000))
-    } catch (error) {
-        console.error('Error al enviar mensaje a Telegram:', error.message)
+    const MAX_RETRIES = 3
+    let retries = 0
 
-        if (error.response?.status === 429) {
-            const retryAfter = error.response.headers['rety-after'] || 10
-            console.log(`Rate limit alcanzado. Reintentando en ${retryAfter} segundos...`)
+    while (retries < MAX_RETRIES) {
+        try {
+            const response = await axios.post(
+                `https://api.telegram.org/bot${telegramBotToken}/sendMessage`,
+                {
+                    chat_id: telegramChatId,
+                    text: message,
+                    parse_mode: 'Markdown'
+                },
+                { timeout: 5000 } // Timeout de 5 segundos
+            )
 
-            await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
-            return sendTelegramAlert(message)
+            await new Promise(resolve => setTimeout(resolve, 1500)) // Espera 1.5s entre mensajes
+            return response.data
+
+        } catch (error) {
+            retries++
+
+            if (error.response?.status === 429) {
+                const retryAfter = error.response.headers['retry-after'] || 10
+                console.log(`Rate limit alcanzado. Reintento ${retries}/${MAX_RETRIES} en ${retryAfter}s`)
+                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
+            } else {
+                console.error(`Error no recuperable (${error.message}). Abortando...`)
+                break
+            }
         }
     }
+
+    throw new Error(`Falló después de ${MAX_RETRIES} intentos`)
 }
 
 async function analyzeAndAlert(exchange, symbol) {
     try {
         const formattedSymbol = symbol.replace('/', '-')
         const ohlcv = await exchange.fetchOHLCV(formattedSymbol, '15m', undefined, 100)
-        
+
         if (!ohlcv || ohlcv.length < 21) return
 
         const indicators = calculateIndicators(ohlcv)
         const lastRsi = indicators.rsi
 
-        if (lastRsi > 70 || lastRsi < 30) {
+        // Verificar si el estado actual es diferente al anterior
+        const lastState = tokenStates.get(symbol)
+        const currentState = {
+            sobrecompra: lastRsi > 70,
+            sobrevendido: lastRsi < 30
+        }
+
+        // Solo enviar alerta si hay cambio de estado
+        if ((currentState.sobrecompra && (!lastState || !lastState.sobrecompra)) ||
+            (currentState.sobrevendido && (!lastState || !lastState.sobrevendido))) {
+
             let condition, recommendation, emoji
-            
-            if (lastRsi > 70) {
+
+            if (currentState.sobrecompra) {
                 condition = "SOBRECOMPRADO 🔴"
-                recommendation = "Considerar **VENDER**"
+                recommendation = "Considerar **VENTA**"
                 emoji = "📉"
             } else {
                 condition = "SOBREVENDIDO 🟢"
-                recommendation = "Considerar **COMPRAR**"
+                recommendation = "Considerar **COMPRA**"
                 emoji = "📈"
             }
 
@@ -132,10 +159,15 @@ async function analyzeAndAlert(exchange, symbol) {
                 + `🔄 Cambio 15m: ${indicators.changePercent.toFixed(2)}%\n`
                 + `\n${recommendation}`
 
-            await Promise.allSettled([
-                sendDiscordAlert(message),
-                sendTelegramAlert(message)
-            ])
+            try {
+                await Promise.allSettled([
+                    sendDiscordAlert(message),
+                    sendTelegramAlert(message)
+                ])
+                tokenStates.set(symbol, currentState) // Actualizar estado solo si se envió
+            } catch (error) {
+                console.error(`Error enviando alertas para ${symbol}:`, error.message)
+            }
         }
     } catch (err) {
         console.error(`Error analizando ${symbol}:`, err.message)
@@ -143,19 +175,24 @@ async function analyzeAndAlert(exchange, symbol) {
 }
 
 async function monitorTokens() {
-    const symbols = await getLeverageTokens()
-    if (!symbols.length) return
+    try {
+        const symbols = await getLeverageTokens()
+        if (!symbols.length) return
 
-    console.log(`Monitoreando ${symbols.length} tokens apalancados...`)
+        console.log(`[${new Date().toISOString()}] Iniciando ciclo de monitoreo...`)
 
-    while (true) {
-        const analysisPromises = symbols.map(async (symbol) => {
-            await analyzeAndAlert(kucoin, symbol);
-            await new Promise(resolve => setTimeout(resolve, 1500))
-        })
+        for (const symbol of symbols) {
+            await analyzeAndAlert(kucoin, symbol)
+            await new Promise(resolve => setTimeout(resolve, 2000)) // 2s entre tokens
+        }
 
-        await Promise.allSettled(analysisPromises)
-        await new Promise(resolve => setTimeout(resolve, 300000))
+        console.log(`[${new Date().toISOString()}] Ciclo completado. Próximo en 5 minutos...`)
+        await new Promise(resolve => setTimeout(resolve, 300000)) // 5 minutos
+
+    } catch (error) {
+        console.error('Error en monitorización:', error)
+    } finally {
+        monitorTokens() // Reiniciar el ciclo
     }
 }
 
