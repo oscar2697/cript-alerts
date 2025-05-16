@@ -55,8 +55,8 @@ async function fetchData(symbol, timeframe = '15m', limit = 100) {
 const ti = require('technicalindicators')
 
 function calculateIndicators(ohlcv) {
-    const close = ohlcv.map(row => row[4]) // índice 4 es 'close'
-    const volume = ohlcv.map(row => row[5]) // índice 5 es 'volume'
+    const close = ohlcv.map(row => row[4])
+    const volume = ohlcv.map(row => row[5])
 
     const ema9 = ti.EMA.calculate({ period: 9, values: close })
     const ema21 = ti.EMA.calculate({ period: 21, values: close })
@@ -141,32 +141,30 @@ async function monitorTokens() {
     while (true) {
         const analysisPromises = symbols.map(async (symbol) => {
             await analyzeAndAlert(kucoin, symbol);
-            await new Promise(resolve => setTimeout(resolve, 1500)) // 1.5s entre tokens
+            await new Promise(resolve => setTimeout(resolve, 1500))
         })
 
         await Promise.allSettled(analysisPromises)
         await new Promise(resolve => setTimeout(resolve, 300000))
     }
+}
 
-
-    async function testKucoinAPI() {
-        try {
-            const res = await axios.get('https://api.kucoin.com/api/v3/currencies')
-            console.log('Respuesta exitosa de KuCoin:', res.data.data.length)
-        } catch (error) {
-            console.error('Error directo al llamar a KuCoin:', error.message)
-        }
+async function testKucoinAPI() {
+    try {
+        const res = await axios.get('https://api.kucoin.com/api/v3/currencies')
+        console.log('Respuesta exitosa de KuCoin:', res.data.data.length)
+    } catch (error) {
+        console.error('Error directo al llamar a KuCoin:', error.message)
     }
 }
 
 testKucoinAPI()
 
-
 app.get('/', (req, res) => {
     res.send('Bot de análisis de criptomonedas en ejecución...')
 })
 
-let isMonitoring = false // Bandera de control
+let isMonitoring = false
 
 app.listen(port, () => {
     console.log(`Servidor corriendo en ${port}`)
