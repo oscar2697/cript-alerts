@@ -99,7 +99,7 @@ async function sendTelegramAlert(message) {
                 { timeout: 5000 }
             )
 
-            await new Promise(resolve => setTimeout(resolve, 1500))
+            await new Promise(resolve => setTimeout(resolve, 3000))
             return response.data
 
         } catch (error) {
@@ -182,7 +182,7 @@ async function monitorTokens() {
 
         for (const symbol of symbols) {
             await analyzeAndAlert(kucoin, symbol)
-            await new Promise(resolve => setTimeout(resolve, 2000))
+            await new Promise(resolve => setTimeout(resolve, 5000))
         }
 
         console.log(`[${new Date().toISOString()}] Ciclo completado. Próximo en 5 minutos...`)
