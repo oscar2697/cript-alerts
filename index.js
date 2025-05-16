@@ -117,11 +117,11 @@ async function analyzeAndAlert(exchange, symbol) {
             
             if (lastRsi > 70) {
                 condition = "SOBRECOMPRADO 🔴"
-                recommendation = "Considerar **VENTA**"
+                recommendation = "Considerar **VENDER**"
                 emoji = "📉"
             } else {
                 condition = "SOBREVENDIDO 🟢"
-                recommendation = "Considerar **COMPRA**"
+                recommendation = "Considerar **COMPRAR**"
                 emoji = "📈"
             }
 
