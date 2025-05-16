@@ -524,7 +524,7 @@ app.post('/test-alerts', async (req, res) => {
 
 app.post('/restart', (req, res) => {
     try {
-        isMonitoringActive = false
+        isMonitoringActive = true
         logEvent('INFO', 'Deteniendo monitorización para reinicio...')
 
         tokenStates.clear()
