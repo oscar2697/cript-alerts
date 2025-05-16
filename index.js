@@ -96,10 +96,10 @@ async function sendTelegramAlert(message) {
                     text: message,
                     parse_mode: 'Markdown'
                 },
-                { timeout: 5000 } // Timeout de 5 segundos
+                { timeout: 5000 } 
             )
 
-            await new Promise(resolve => setTimeout(resolve, 1500)) // Espera 1.5s entre mensajes
+            await new Promise(resolve => setTimeout(resolve, 1500)) 
             return response.data
 
         } catch (error) {
@@ -129,14 +129,12 @@ async function analyzeAndAlert(exchange, symbol) {
         const indicators = calculateIndicators(ohlcv)
         const lastRsi = indicators.rsi
 
-        // Verificar si el estado actual es diferente al anterior
         const lastState = tokenStates.get(symbol)
         const currentState = {
             sobrecompra: lastRsi > 70,
             sobrevendido: lastRsi < 30
         }
 
-        // Solo enviar alerta si hay cambio de estado
         if ((currentState.sobrecompra && (!lastState || !lastState.sobrecompra)) ||
             (currentState.sobrevendido && (!lastState || !lastState.sobrevendido))) {
 
@@ -144,11 +142,11 @@ async function analyzeAndAlert(exchange, symbol) {
 
             if (currentState.sobrecompra) {
                 condition = "SOBRECOMPRADO 🔴"
-                recommendation = "Considerar **VENTA**"
+                recommendation = "Considerar **VENDER**"
                 emoji = "📉"
             } else {
                 condition = "SOBREVENDIDO 🟢"
-                recommendation = "Considerar **COMPRA**"
+                recommendation = "Considerar **COMPRAR**"
                 emoji = "📈"
             }
 
@@ -164,7 +162,7 @@ async function analyzeAndAlert(exchange, symbol) {
                     sendDiscordAlert(message),
                     sendTelegramAlert(message)
                 ])
-                tokenStates.set(symbol, currentState) // Actualizar estado solo si se envió
+                tokenStates.set(symbol, currentState) 
             } catch (error) {
                 console.error(`Error enviando alertas para ${symbol}:`, error.message)
             }
@@ -183,16 +181,16 @@ async function monitorTokens() {
 
         for (const symbol of symbols) {
             await analyzeAndAlert(kucoin, symbol)
-            await new Promise(resolve => setTimeout(resolve, 2000)) // 2s entre tokens
+            await new Promise(resolve => setTimeout(resolve, 2000)) 
         }
 
         console.log(`[${new Date().toISOString()}] Ciclo completado. Próximo en 5 minutos...`)
-        await new Promise(resolve => setTimeout(resolve, 300000)) // 5 minutos
+        await new Promise(resolve => setTimeout(resolve, 300000)) 
 
     } catch (error) {
         console.error('Error en monitorización:', error)
     } finally {
-        monitorTokens() // Reiniciar el ciclo
+        monitorTokens() 
     }
 }
 
