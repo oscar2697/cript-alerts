@@ -65,10 +65,19 @@ async function getLeverageTokens() {
     try {
         const markets = await kucoin.loadMarkets(true)
         return Object.values(markets)
-            .filter(m => m.active && m.leveraged && m.quote === 'USDT')
+            .filter(m =>
+                m.active !== false &&
+                m.leveraged === true &&
+                m.quote === 'USDT' &&
+                m.symbol.endsWith("3L/USDT") || m.symbol.endsWith("3S/USDT")
+            )
             .map(m => m.symbol)
     } catch (error) {
-        logEvent('ERROR', 'Error cargando mercados', { error: error.stack })
+        logEvent('ERROR', 'Fallo crítico al cargar mercados', {
+            error: error.message,
+            stack: error.stack,
+            apiStatus: kucoin.lastResponseHeaders ? kucoin.lastResponseHeaders['x-ratelimit-remaining'] : 'N/A'
+        });
         return []
     }
 }
@@ -182,6 +191,34 @@ async function analyzeAndAlert(symbol) {
     }
 }
 
+async function initializeMarkets(retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await kucoin.loadMarkets(true);
+            logEvent('INFO', 'Mercados cargados exitosamente');
+            return true;
+        } catch (error) {
+            if (i === retries - 1) throw error;
+            logEvent('WARN', `Reintentando carga de mercados (${i + 1}/${retries})`);
+            await new Promise(resolve => setTimeout(resolve, 10000 * (i + 1)));
+        }
+    }
+}
+
+setTimeout(async () => {
+    try {
+        await initializeMarkets();
+        isMonitoringActive = true;
+        monitorTokens();
+    } catch (error) {
+        logEvent('ERROR', 'Fallo permanente al cargar mercados', {
+            error: error.stack,
+            action: 'Reiniciando servicio...'
+        });
+        process.exit(1);
+    }
+}, 15000);
+
 async function monitorTokens() {
     if (!isMonitoringActive) return
 
@@ -244,6 +281,22 @@ app.post('/restart', (req, res) => {
     monitorTokens()
     res.json({ status: 'restarting' })
 })
+
+app.get('/debug-auth', async (req, res) => {
+    try {
+        const response = await kucoin.fetchBalance();
+        res.json({
+            status: 'success',
+            account: response.info.data
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Fallo de autenticación',
+            details: error.message,
+            stack: error.stack
+        });
+    }
+});
 
 process.on('SIGTERM', () => {
     isMonitoringActive = false
