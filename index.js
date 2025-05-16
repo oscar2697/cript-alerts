@@ -96,10 +96,10 @@ async function sendTelegramAlert(message) {
                     text: message,
                     parse_mode: 'Markdown'
                 },
-                { timeout: 5000 } 
+                { timeout: 5000 }
             )
 
-            await new Promise(resolve => setTimeout(resolve, 1500)) 
+            await new Promise(resolve => setTimeout(resolve, 1500))
             return response.data
 
         } catch (error) {
@@ -134,6 +134,7 @@ async function analyzeAndAlert(exchange, symbol) {
             sobrecompra: lastRsi > 70,
             sobrevendido: lastRsi < 30
         }
+        console.log(`[ANÁLISIS] ${symbol} - RSI: ${lastRsi} | Estado: ${currentState.sobrecompra ? 'SOBRECOMPRA' : currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
 
         if ((currentState.sobrecompra && (!lastState || !lastState.sobrecompra)) ||
             (currentState.sobrevendido && (!lastState || !lastState.sobrevendido))) {
@@ -162,7 +163,7 @@ async function analyzeAndAlert(exchange, symbol) {
                     sendDiscordAlert(message),
                     sendTelegramAlert(message)
                 ])
-                tokenStates.set(symbol, currentState) 
+                tokenStates.set(symbol, currentState)
             } catch (error) {
                 console.error(`Error enviando alertas para ${symbol}:`, error.message)
             }
@@ -170,7 +171,6 @@ async function analyzeAndAlert(exchange, symbol) {
     } catch (err) {
         console.error(`Error analizando ${symbol}:`, err.message)
     }
-    console.log(`[ANÁLISIS] ${symbol} - RSI: ${lastRsi} | Estado: ${currentState.sobrecompra ? 'SOBRECOMPRA' : currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
 }
 
 async function monitorTokens() {
@@ -182,16 +182,16 @@ async function monitorTokens() {
 
         for (const symbol of symbols) {
             await analyzeAndAlert(kucoin, symbol)
-            await new Promise(resolve => setTimeout(resolve, 2000)) 
+            await new Promise(resolve => setTimeout(resolve, 2000))
         }
 
         console.log(`[${new Date().toISOString()}] Ciclo completado. Próximo en 5 minutos...`)
-        await new Promise(resolve => setTimeout(resolve, 300000)) 
+        await new Promise(resolve => setTimeout(resolve, 300000))
 
     } catch (error) {
         console.error('Error en monitorización:', error)
     } finally {
-        monitorTokens() 
+        monitorTokens()
     }
     console.log(`[INICIO CICLO] ${new Date().toISOString()}`)
 }
