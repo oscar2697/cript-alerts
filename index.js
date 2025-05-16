@@ -15,8 +15,11 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
 const kucoin = new ccxt.kucoin({
     enableRateLimit: true,
-    rateLimit: 1000,
-    timeout: 30000
+    rateLimit: 3000,
+    timeout: 30000,
+    apiKey: process.env.KUCOIN_API_KEY,
+    secret: process.env.KUCOIN_API_SECRET,
+    password: process.env.KUCOIN_API_PASSPHRASE
 })
 
 const tokenStates = new Map()
@@ -41,88 +44,57 @@ async function saveLog(data) {
             const existingData = await fs.readFile(LOG_FILE, 'utf8')
             logs = JSON.parse(existingData)
             if (logs.length >= 100) logs = logs.slice(-99)
-        } catch (err) {
-            logs = []
-        }
+        } catch (err) { }
 
-        logs.push({
-            timestamp: new Date().toISOString(),
-            ...data
-        })
-
+        logs.push({ timestamp: new Date().toISOString(), ...data })
         await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2))
-    } catch (err) {
-        console.error('Error guardando logs:', err.message)
-    }
+    } catch (err) { }
 }
 
 function logEvent(type, message, data = {}) {
     const logData = { type, message, ...data }
     console.log(`[${new Date().toISOString()}] [${type}] ${message}`)
     saveLog(logData)
-
     if (type === 'ERROR') {
-        botStats.errors.push({
-            time: new Date().toISOString(),
-            message,
-            ...data
-        })
-
-        if (botStats.errors.length > 20) {
-            botStats.errors.shift()
-        }
+        botStats.errors.push({ time: new Date().toISOString(), message, ...data })
+        if (botStats.errors.length > 20) botStats.errors.shift()
     }
 }
 
 async function getLeverageTokens() {
     try {
-        const markets = await kucoin.loadMarkets()
-
-        const leverageTokens = Object.keys(markets).filter(symbol => {
-            return /[0-9]+[LS]\/USDT$/.test(symbol)
-        })
-
-        logEvent('INFO', `Tokens apalancados encontrados: ${leverageTokens.length}`)
-        return leverageTokens
+        const markets = await kucoin.loadMarkets(true)
+        return Object.values(markets)
+            .filter(m => m.active && m.leveraged && m.quote === 'USDT')
+            .map(m => m.symbol)
     } catch (error) {
-        logEvent('ERROR', 'Error al cargar los mercados de KuCoin', { error: error.message })
+        logEvent('ERROR', 'Error cargando mercados', { error: error.stack })
         return []
     }
 }
 
-async function fetchOHLCVData(symbol, timeframe = '15m', limit = 100) {
-    try {
-        const ohlcv = await kucoin.fetchOHLCV(symbol, timeframe, undefined, limit)
-        if (!ohlcv || ohlcv.length < 21 || !ohlcv.every(entry => entry.length >= 6)) {
-            logEvent('WARN', `Datos OHLCV inválidos o insuficientes para ${symbol}`)
-            return null
+async function fetchWithRetry(symbol, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const ohlcv = await kucoin.fetchOHLCV(symbol, '15m', undefined, 100)
+            if (!ohlcv || ohlcv.length < 21) throw new Error('Datos insuficientes')
+            return ohlcv
+        } catch (error) {
+            if (i === retries - 1) throw error
+            await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1)))
         }
-        return ohlcv
-    } catch (error) {
-        logEvent('ERROR', `Error al obtener datos OHLCV para ${symbol}`, { error: error.message })
-        return null
     }
 }
 
-
 function calculateIndicators(ohlcv) {
-    if (!ohlcv || ohlcv.length < 21) return null
-
-    const close = ohlcv.map(candle => candle[4])
-    const volume = ohlcv.map(candle => candle[5])
-
-    if (close.length < 21 || volume.length < 20) return null
-
     try {
+        const close = ohlcv.map(c => c[4]).slice(-21)
+        const volume = ohlcv.map(c => c[5]).slice(-20)
+
         const ema9 = ti.EMA.calculate({ period: 9, values: close })
         const ema21 = ti.EMA.calculate({ period: 21, values: close })
         const rsi = ti.RSI.calculate({ period: 14, values: close })
         const volumeAvg = ti.SMA.calculate({ period: 20, values: volume })
-
-        if (ema9.length === 0 || ema21.length === 0 || rsi.length === 0 || volumeAvg.length === 0) {
-            logEvent('WARN', `Cálculo de indicadores falló para algún indicador`)
-            return null
-        }
 
         return {
             lastClose: close[close.length - 1],
@@ -133,39 +105,15 @@ function calculateIndicators(ohlcv) {
             volumeAvg: volumeAvg[volumeAvg.length - 1]
         }
     } catch (error) {
-        logEvent('ERROR', 'Error al calcular indicadores', { error: error.message })
+        logEvent('ERROR', 'Error calculando indicadores', { error: error.stack })
         return null
     }
 }
 
 async function sendTelegramAlert(message) {
-    if (!telegramBotToken || !telegramChatId) {
-        logEvent('WARN', 'Configuración de Telegram incompleta')
-        return { success: false, error: 'Configuración incompleta' }
-    }
-
     const MAX_RETRIES = 3
-
     for (let retry = 0; retry < MAX_RETRIES; retry++) {
         try {
-            logEvent('DEBUG', `Intento ${retry + 1}/${MAX_RETRIES} de enviar alerta a Telegram`)
-
-            const botCheckUrl = `https://api.telegram.org/bot${telegramBotToken}/getMe`
-            try {
-                await axios.get(botCheckUrl, { timeout: 5000 })
-            } catch (checkErr) {
-                logEvent('ERROR', 'El bot de Telegram parece no estar activo', {
-                    error: checkErr.message,
-                    response: checkErr.response ? {
-                        status: checkErr.response.status,
-                        data: checkErr.response.data
-                    } : 'No response'
-                })
-
-                await new Promise(resolve => setTimeout(resolve, 5000))
-                continue
-            }
-
             const response = await axios.post(
                 `https://api.telegram.org/bot${telegramBotToken}/sendMessage`,
                 {
@@ -176,332 +124,151 @@ async function sendTelegramAlert(message) {
                 { timeout: 8000 }
             )
 
-            if (response.data && response.data.ok) {
-                logEvent('INFO', 'Alerta enviada a Telegram con éxito')
+            if (response.data?.ok) {
                 botStats.lastSuccessfulAlert = new Date()
                 return { success: true }
-            } else {
-                logEvent('WARN', 'Telegram respondió sin confirmar éxito', {
-                    response: response.data
-                })
             }
-
         } catch (error) {
-            const errorDetails = {
-                retry: retry + 1,
-                error: error.message,
-                response: error.response ? {
-                    status: error.response.status,
-                    data: error.response.data
-                } : 'No response data'
-            }
-
-            logEvent('ERROR', `Error al enviar mensaje a Telegram (intento ${retry + 1}/${MAX_RETRIES})`, errorDetails)
-
             if (error.response?.status === 429) {
                 const retryAfter = error.response.headers['retry-after'] || 15
-                logEvent('WARN', `Rate limit de Telegram alcanzado. Reintentando en ${retryAfter} segundos`)
                 await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
-            } else if (error.response?.status === 400 && error.response?.data?.description?.includes('chat not found')) {
-                logEvent('ERROR', 'El chat_id de Telegram es incorrecto', { chatId: telegramChatId })
-                return { success: false, error: 'Chat ID incorrecto' }
-            } else {
-                await new Promise(resolve => setTimeout(resolve, 5000))
             }
         }
+        await new Promise(resolve => setTimeout(resolve, 5000))
     }
-
-    logEvent('ERROR', `Falló el envío a Telegram después de ${MAX_RETRIES} intentos`)
-    return { success: false, error: `Falló después de ${MAX_RETRIES} intentos` }
-}
-
-async function sendTestMessages() {
-    logEvent('INFO', 'Enviando mensajes de prueba...')
-
-    const message = `🧪 *TEST ALERT* 🧪\nEste es un mensaje de prueba para verificar la configuración.\nHora del servidor: ${new Date().toISOString()}`
-    const telegramResult = await sendTelegramAlert(message + '\n\n_Enviado a Telegram_')
-
-    return {
-        telegram: telegramResult,
-        time: new Date().toISOString()
-    }
+    return { success: false }
 }
 
 async function analyzeAndAlert(symbol) {
     try {
-        const startTime = Date.now()
-        logEvent('DEBUG', `Iniciando análisis de ${symbol}`)
-        if (!ohlcv) return false
-
+        const start = Date.now()
+        const ohlcv = await fetchWithRetry(symbol)
         const indicators = calculateIndicators(ohlcv)
         if (!indicators) return false
 
-        const lastRsi = indicators.rsi
+        const currentRsi = indicators.rsi
+        const lastState = tokenStates.get(symbol) || { sobrecompra: false, sobrevendido: false, lastAlert: 0 }
 
-        const lastState = tokenStates.get(symbol) || {
-            sobrecompra: false,
-            sobrevendido: false,
-            lastAlert: 0,
-            lastCheck: 0,
-            rsi: null
-        }
-
-        const currentState = {
-            sobrecompra: lastRsi > 70,
-            sobrevendido: lastRsi < 30,
-            lastAlert: lastState.lastAlert,
+        const newState = {
+            sobrecompra: currentRsi > 70,
+            sobrevendido: currentRsi < 30,
             lastCheck: Date.now(),
-            rsi: lastRsi
+            rsi: currentRsi
         }
 
-        logEvent('INFO', `[ANÁLISIS] ${symbol} - RSI: ${lastRsi.toFixed(2)} | Estado: ${currentState.sobrecompra ? 'SOBRECOMPRA' :
-            currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
+        const shouldAlert = (newState.sobrecompra && !lastState.sobrecompra) ||
+            (newState.sobrevendido && !lastState.sobrevendido)
 
-        const tiempoDesdeUltimaAlerta = Date.now() - lastState.lastAlert
-        const MIN_TIME_BETWEEN_ALERTS = 15 * 60 * 1000
+        if (shouldAlert) {
+            const condition = newState.sobrecompra ? "SOBRECOMPRADO 🔴" : "SOBREVENDIDO 🟢"
+            const message = `${newState.sobrecompra ? "📉" : "📈"} *${symbol}* | ${condition}\n` +
+                `💰 Precio: ${indicators.lastClose.toFixed(4)} USDT\n` +
+                `📊 RSI: ${currentRsi.toFixed(2)}\n` +
+                `🔄 Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
 
-        const debemosEnviarAlerta =
-            (currentState.sobrecompra && !lastState.sobrecompra) ||
-            (currentState.sobrevendido && !lastState.sobrevendido) ||
-            ((currentState.sobrecompra || currentState.sobrevendido) &&
-                tiempoDesdeUltimaAlerta > MIN_TIME_BETWEEN_ALERTS)
-
-        if (debemosEnviarAlerta) {
-            botStats.totalAlertsTriggered++
-            let condition, recommendation, emoji
-
-            if (currentState.sobrecompra) {
-                condition = "SOBRECOMPRADO 🔴"
-                recommendation = "Considerar **VENDER**"
-                emoji = "📉"
-            } else if (currentState.sobrevendido) {
-                condition = "SOBREVENDIDO 🟢"
-                recommendation = "Considerar **COMPRAR**"
-                emoji = "📈"
-            } else {
-                return false
+            const result = await sendTelegramAlert(message)
+            if (result.success) {
+                newState.lastAlert = Date.now()
+                botStats.totalAlertsSent++
+                logEvent('INFO', `Alerta enviada: ${symbol}`)
             }
-
-            const message = `${emoji} *${symbol}* | ${condition}\n`
-                + `💰 Precio: ${indicators.lastClose.toFixed(4)} USDT\n`
-                + `📊 RSI: ${lastRsi.toFixed(2)}\n`
-                + `📶 EMA9/21: ${indicators.ema9.toFixed(4)} | ${indicators.ema21.toFixed(4)}\n`
-                + `🔄 Cambio 15m: ${indicators.changePercent.toFixed(2)}%\n`
-                + `\n${recommendation}`
-
-            try {
-                logEvent('INFO', `Enviando alertas para ${symbol}...`)
-                const telegramResult = await sendTelegramAlert(message)
-
-                if (telegramSent) {
-                    logEvent('INFO', `✅ Alerta enviada a Telegram para ${symbol}`)
-                } else {
-                    logEvent('WARN', `❌ Error al enviar alerta a Telegram para ${symbol}`, { error: telegramResult.error })
-                }
-
-                if (telegramResult.success) { 
-                    logEvent('INFO', `✅ Alerta enviada a Telegram para ${symbol}`)
-                    botStats.totalAlertsSent++
-                    currentState.lastAlert = Date.now()
-                    tokenStates.set(symbol, currentState)
-                    return true
-                } else {
-                    logEvent('WARN', `❌ Error al enviar alerta a Telegram para ${symbol}`, { error: telegramResult.error })
-                    botStats.failedAlerts++
-                }
-
-                logEvent('DEBUG', `Tiempo análisis ${symbol}: ${Date.now() - startTime}ms`)
-            } catch (error) {
-                logEvent('ERROR', `Error general enviando alertas para ${symbol}`, { error: error.message })
-                botStats.failedAlerts++
-            }
-        } else {
-            tokenStates.set(symbol, currentState)
+            tokenStates.set(symbol, newState)
+            return result.success
         }
-    } catch (err) {
-        logEvent('ERROR', `Error analizando ${symbol}`, { error: err.message })
+        return false
+    } catch (error) {
+        logEvent('ERROR', `Error analizando ${symbol}`, { error: error.stack })
+        return false
     }
-
-    return false
 }
 
 async function monitorTokens() {
     if (!isMonitoringActive) return
 
     try {
-        logEvent('INFO', `Iniciando ciclo de monitoreo #${botStats.cyclesCompleted + 1}...`)
+        logEvent('INFO', `Iniciando ciclo #${botStats.cyclesCompleted + 1}`)
         const symbols = await getLeverageTokens()
+        if (!symbols.length) return
 
-        if (!symbols?.length) {
-            logEvent('WARN', 'No hay símbolos para monitorear')
-            return
-        }
-
-        let alertasSent = 0
-        const CONCURRENCY = 5 
-        const BATCH_DELAY = 5000 
+        let alertsSent = 0
+        const CONCURRENCY = 3
+        const BATCH_DELAY = 10000
 
         for (let i = 0; i < symbols.length; i += CONCURRENCY) {
             if (!isMonitoringActive) break
 
             const batch = symbols.slice(i, i + CONCURRENCY)
-            const results = await Promise.allSettled(
-                batch.map(symbol => analyzeAndAlert(symbol))
-            )
+            const results = await Promise.allSettled(batch.map(symbol => analyzeAndAlert(symbol)))
+            alertsSent += results.filter(r => r.status === 'fulfilled' && r.value).length
 
-            alertasSent += results.filter(r => r.status === 'fulfilled' && r.value).length
             await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
         }
 
         botStats.cyclesCompleted++
-        logEvent('INFO', `Ciclo #${botStats.cyclesCompleted} completado. ${alertasSent} alertas enviadas.`)
+        logEvent('INFO', `Ciclo completado. Alertas: ${alertsSent}`)
     } catch (error) {
-        logEvent('ERROR', 'Error fatal en monitorTokens', { error: error.stack })
+        logEvent('ERROR', 'Error en monitorización', { error: error.stack })
     } finally {
-        if (isMonitoringActive) {
-            setTimeout(monitorTokens, 5 * 60 * 1000)
-            logEvent('INFO', `Próximo ciclo programado en 5 minutos...`)
-        }
-    }
-}
-
-async function testKucoinAPI() {
-    try {
-        const startTime = Date.now()
-        const res = await axios.get('https://api.kucoin.com/api/v3/currencies', { timeout: 10000 })
-        const endTime = Date.now()
-        const responseTime = endTime - startTime
-
-        logEvent('INFO', `Conexión exitosa con KuCoin: ${res.data.data.length} monedas disponibles (${responseTime}ms)`)
-        return true
-    } catch (error) {
-        logEvent('ERROR', 'Error al conectar con KuCoin', { error: error.message })
-        return false
+        if (isMonitoringActive) setTimeout(monitorTokens, 300000)
     }
 }
 
 app.use(express.json())
 
 app.get('/', (req, res) => {
-    const status = isMonitoringActive ? 'activo' : 'inactivo'
-    res.send(`Bot de análisis de criptomonedas: ${status} (${new Date().toISOString()})`)
+    res.json({
+        status: isMonitoringActive ? 'active' : 'inactive',
+        uptime: Math.floor(process.uptime())
+    })
 })
 
 app.get('/status', (req, res) => {
-    const status = {
-        isMonitoring: isMonitoringActive,
-        tokenCount: tokenStates.size,
-        startTime: botStats.startTime,
-        uptime: Math.floor((Date.now() - botStats.startTime) / (1000 * 60)),
-        cyclesCompleted: botStats.cyclesCompleted,
-        totalAlertsTriggered: botStats.totalAlertsTriggered,
-        totalAlertsSent: botStats.totalAlertsSent,
-        failedAlerts: botStats.failedAlerts,
-        lastSuccessfulAlert: botStats.lastSuccessfulAlert,
-        tokens: [...tokenStates].map(([symbol, state]) => ({
-            symbol,
-            rsi: state.rsi,
-            sobrecompra: state.sobrecompra,
-            sobrevendido: state.sobrevendido,
-            lastAlertTime: state.lastAlert ? new Date(state.lastAlert).toISOString() : null
-        })).slice(0, 20),
-        recentErrors: botStats.errors.slice(-5)
-    }
-    res.json(status)
-})
-
-app.get('/logs', async (req, res) => {
-    try {
-        const data = await fs.readFile(LOG_FILE, 'utf8')
-        const logs = JSON.parse(data)
-        res.json(logs)
-    } catch (err) {
-        res.status(500).json({ error: 'Error leyendo logs', details: err.message })
-    }
-})
-
-app.post('/test-alerts', async (req, res) => {
-    try {
-        const results = await sendTestMessages()
-        res.json(results)
-    } catch (err) {
-        res.status(500).json({ error: 'Error enviando mensajes de prueba', details: err.message })
-    }
+    res.json({
+        ...botStats,
+        lastSuccessfulAlert: botStats.lastSuccessfulAlert?.toISOString(),
+        startTime: botStats.startTime.toISOString()
+    })
 })
 
 app.post('/restart', (req, res) => {
-    try {
-        isMonitoringActive = true
-        logEvent('INFO', 'Deteniendo monitorización para reinicio...')
-
-        tokenStates.clear()
-
-        botStats.cyclesCompleted = 0
-        botStats.totalAlertsTriggered = 0
-        botStats.totalAlertsSent = 0
-        botStats.failedAlerts = 0
-        botStats.lastSuccessfulAlert = null
-        botStats.errors = []
-        botStats.startTime = new Date()
-
-        setTimeout(() => {
-            logEvent('INFO', 'Reiniciando monitorización...')
-            isMonitoringActive = true
-            monitorTokens()
-            sendTestMessages()
-        }, 5000)
-
-        res.json({ success: true, message: 'Bot reiniciando, la monitorización se reactivará en 5 segundos' })
-
-    } catch (err) {
-        res.status(500).json({ error: 'Error reiniciando el bot', details: err.message })
-    }
-})
-
-app.listen(port, async () => {
-    console.log(`Servidor corriendo en puerto ${port}`)
-    const apiWorks = await testKucoinAPI()
-
-    if (apiWorks && !isMonitoringActive) {
-        isMonitoringActive = true
-        logEvent('INFO', 'Iniciando monitorización de tokens...')
-
-        try {
-            await sendTestMessages()
-        } catch (error) {
-            logEvent('ERROR', 'Error enviando mensajes de prueba al inicio', { error: error.message })
-        }
-
-        monitorTokens()
-    } else if (!apiWorks) {
-        logEvent('ERROR', 'No se pudo iniciar la monitorización debido a problemas con la API de KuCoin')
-    }
+    isMonitoringActive = true
+    tokenStates.clear()
+    Object.assign(botStats, {
+        cyclesCompleted: 0,
+        totalAlertsTriggered: 0,
+        totalAlertsSent: 0,
+        failedAlerts: 0,
+        errors: [],
+        startTime: new Date()
+    })
+    monitorTokens()
+    res.json({ status: 'restarting' })
 })
 
 process.on('SIGTERM', () => {
-    logEvent('INFO', 'Señal SIGTERM recibida, deteniendo monitorización')
     isMonitoringActive = false
-    setTimeout(() => {
-        process.exit(0)
-    }, 5000)
+    setTimeout(() => process.exit(0), 5000)
 })
 
 process.on('SIGINT', () => {
-    logEvent('INFO', 'Señal SIGINT recibida, deteniendo monitorización')
     isMonitoringActive = false
-    setTimeout(() => {
-        process.exit(0)
-    }, 5000)
+    setTimeout(() => process.exit(0), 5000)
 })
 
 process.on('uncaughtException', (error) => {
-    logEvent('ERROR', 'Excepción no capturada', { error: error.stack })
+    logEvent('ERROR', 'Excepción no capturada', { stack: error.stack })
     setTimeout(() => process.exit(1), 10000)
 })
 
-process.on('unhandledRejection', (reason, promise) => {
-    logEvent('ERROR', 'Promesa rechazada no manejada', { 
-        reason: reason.stack || reason,
-        promise: promise
-    })
+process.on('unhandledRejection', (reason) => {
+    logEvent('ERROR', 'Promesa rechazada', { reason: reason.stack || reason })
+})
+
+setTimeout(() => {
+    isMonitoringActive = true
+    monitorTokens()
+}, 15000)
+
+app.listen(port, () => {
+    logEvent('INFO', `Servidor iniciado en puerto ${port}`)
 })
