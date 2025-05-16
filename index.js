@@ -104,23 +104,33 @@ async function sendTelegramAlert(message) {
 
 async function analyzeAndAlert(exchange, symbol) {
     try {
-        const formattedSymbol = symbol.replace('/', '-');
+        const formattedSymbol = symbol.replace('/', '-')
         const ohlcv = await exchange.fetchOHLCV(formattedSymbol, '15m', undefined, 100)
-
+        
         if (!ohlcv || ohlcv.length < 21) return
 
         const indicators = calculateIndicators(ohlcv)
         const lastRsi = indicators.rsi
 
-        // Solo enviar alertas si RSI está en zona extrema
         if (lastRsi > 70 || lastRsi < 30) {
-            const condition = lastRsi > 70 ? "Sobrecomprado 🔴" : "Sobrevendido 🟢"
+            let condition, recommendation, emoji
+            
+            if (lastRsi > 70) {
+                condition = "SOBRECOMPRADO 🔴"
+                recommendation = "Considerar **VENTA**"
+                emoji = "📉"
+            } else {
+                condition = "SOBREVENDIDO 🟢"
+                recommendation = "Considerar **COMPRA**"
+                emoji = "📈"
+            }
 
-            const message = `📊 *${symbol}* (${condition})\n`
-                + `Precio: ${indicators.lastClose.toFixed(4)} USDT\n`
-                + `RSI: ${lastRsi.toFixed(2)}\n`
-                + `EMA9/21: ${indicators.ema9.toFixed(4)} | ${indicators.ema21.toFixed(4)}\n`
-                + `Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
+            const message = `${emoji} *${symbol}* | ${condition}\n`
+                + `💰 Precio: ${indicators.lastClose.toFixed(4)} USDT\n`
+                + `📊 RSI: ${lastRsi.toFixed(2)}\n`
+                + `📶 EMA9/21: ${indicators.ema9.toFixed(4)} | ${indicators.ema21.toFixed(4)}\n`
+                + `🔄 Cambio 15m: ${indicators.changePercent.toFixed(2)}%\n`
+                + `\n${recommendation}`
 
             await Promise.allSettled([
                 sendDiscordAlert(message),
