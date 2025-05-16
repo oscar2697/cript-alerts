@@ -88,40 +88,44 @@ async function sendTelegramAlert(message) {
             text: message,
             parse_mode: 'Markdown'
         })
+        await new Promise(resolve => setTimeout(resolve, 1000))
     } catch (error) {
         console.error('Error al enviar mensaje a Telegram:', error.message)
+
+        if (error.response?.status === 429) {
+            const retryAfter = error.response.headers['rety-after'] || 10
+            console.log(`Rate limit alcanzado. Reintentando en ${retryAfter} segundos...`)
+
+            await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
+            return sendTelegramAlert(message)
+        }
     }
 }
 
 async function analyzeAndAlert(exchange, symbol) {
     try {
-        const formattedSymbol = symbol.replace('/', '-')
+        const formattedSymbol = symbol.replace('/', '-');
         const ohlcv = await exchange.fetchOHLCV(formattedSymbol, '15m', undefined, 100)
 
-        if (!ohlcv || ohlcv.length < 21) {
-            console.log(`Datos insuficientes para ${symbol}`)
-            return
-        }
+        if (!ohlcv || ohlcv.length < 21) return
 
         const indicators = calculateIndicators(ohlcv)
+        const lastRsi = indicators.rsi
 
-        if (indicators.rsi > 70 || calculateIndicators(ohlcv)) {
-            let message = `📊 *Análisis del token ${symbol}*\n`
-            message += `Precio actual: ${indicators.lastClose.toFixed(4)} USDT\n`
-            message += `Cambio reciente: ${indicators.changePercent.toFixed(2)}%\n`
-            message += `RSI: ${indicators.rsi.toFixed(2)}\n`
-            message += `EMA9: ${indicators.ema9.toFixed(4)}, EMA21: ${indicators.ema21.toFixed(4)}\n`
+        // Solo enviar alertas si RSI está en zona extrema
+        if (lastRsi > 70 || lastRsi < 30) {
+            const condition = lastRsi > 70 ? "Sobrecomprado 🔴" : "Sobrevendido 🟢"
 
-            if (indicators.rsi > 70) {
-                message += `⚠️ *Sobrecomprado (RSI > 70)*. Considera vender.`
-            } else if (indicators.rsi < 30) {
-                message += `📈 *Sobrevendido (RSI < 30)*. Considera comprar.`
-            }
+            const message = `📊 *${symbol}* (${condition})\n`
+                + `Precio: ${indicators.lastClose.toFixed(4)} USDT\n`
+                + `RSI: ${lastRsi.toFixed(2)}\n`
+                + `EMA9/21: ${indicators.ema9.toFixed(4)} | ${indicators.ema21.toFixed(4)}\n`
+                + `Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
 
-            await sendDiscordAlert(message)
-            await sendTelegramAlert(message)
-        } else {
-            console.log(`No se envía alerta para ${symbol}, RSI neutro (${indicators.rsi.toFixed(2)})`)
+            await Promise.allSettled([
+                sendDiscordAlert(message),
+                sendTelegramAlert(message)
+            ])
         }
     } catch (err) {
         console.error(`Error analizando ${symbol}:`, err.message)
@@ -130,31 +134,28 @@ async function analyzeAndAlert(exchange, symbol) {
 
 async function monitorTokens() {
     const symbols = await getLeverageTokens()
-
-    if (!symbols.length) {
-        console.log('No se encontraron tokens apalancados.')
-        return
-    }
+    if (!symbols.length) return
 
     console.log(`Monitoreando ${symbols.length} tokens apalancados...`)
 
     while (true) {
-        for (const symbol of symbols) {
-            await analyzeAndAlert(kucoin, symbol)
-            await new Promise(resolve => setTimeout(resolve, 1000)) // Esperar 1 segundo entre tokens
-        }
+        const analysisPromises = symbols.map(async (symbol) => {
+            await analyzeAndAlert(kucoin, symbol);
+            await new Promise(resolve => setTimeout(resolve, 1500)) // 1.5s entre tokens
+        })
 
-        await new Promise(resolve => setTimeout(resolve, 300000)) // Esperar 5 min
+        await Promise.allSettled(analysisPromises)
+        await new Promise(resolve => setTimeout(resolve, 300000))
     }
-}
 
 
-async function testKucoinAPI() {
-    try {
-        const res = await axios.get('https://api.kucoin.com/api/v3/currencies')
-        console.log('Respuesta exitosa de KuCoin:', res.data.data.length)
-    } catch (error) {
-        console.error('Error directo al llamar a KuCoin:', error.message)
+    async function testKucoinAPI() {
+        try {
+            const res = await axios.get('https://api.kucoin.com/api/v3/currencies')
+            console.log('Respuesta exitosa de KuCoin:', res.data.data.length)
+        } catch (error) {
+            console.error('Error directo al llamar a KuCoin:', error.message)
+        }
     }
 }
 
@@ -165,7 +166,15 @@ app.get('/', (req, res) => {
     res.send('Bot de análisis de criptomonedas en ejecución...')
 })
 
+let isMonitoring = false // Bandera de control
+
 app.listen(port, () => {
     console.log(`Servidor corriendo en ${port}`)
-    monitorTokens()
+    if (!isMonitoring) {
+        isMonitoring = true
+        monitorTokens().catch(err => {
+            console.error('Error en el monitoreo:', err)
+            isMonitoring = false
+        })
+    }
 })
