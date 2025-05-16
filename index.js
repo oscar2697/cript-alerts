@@ -170,6 +170,7 @@ async function analyzeAndAlert(exchange, symbol) {
     } catch (err) {
         console.error(`Error analizando ${symbol}:`, err.message)
     }
+    console.log(`[ANÁLISIS] ${symbol} - RSI: ${lastRsi} | Estado: ${currentState.sobrecompra ? 'SOBRECOMPRA' : currentState.sobrevendido ? 'SOBREVENTA' : 'NEUTRO'}`)
 }
 
 async function monitorTokens() {
@@ -192,6 +193,7 @@ async function monitorTokens() {
     } finally {
         monitorTokens() 
     }
+    console.log(`[INICIO CICLO] ${new Date().toISOString()}`)
 }
 
 async function testKucoinAPI() {
