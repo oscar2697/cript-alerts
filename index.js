@@ -15,11 +15,15 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
 const kucoin = new ccxt.kucoin({
     enableRateLimit: true,
-    rateLimit: 3000,
-    timeout: 30000,
+    rateLimit: 10000,
+    timeout: 45000,
     apiKey: process.env.KUCOIN_API_KEY,
     secret: process.env.KUCOIN_API_SECRET,
-    password: process.env.KUCOIN_API_PASSPHRASE
+    password: process.env.KUCOIN_API_PASSPHRASE,
+    options: {
+        adjustForTimeDifference: true,
+        recvWindow: 60000
+    }
 })
 
 const tokenStates = new Map()
@@ -219,36 +223,67 @@ setTimeout(async () => {
     }
 }, 15000);
 
-async function monitorTokens() {
-    if (!isMonitoringActive) return
-
+async function initializeService() {
     try {
-        logEvent('INFO', `Iniciando ciclo #${botStats.cyclesCompleted + 1}`)
-        const symbols = await getLeverageTokens()
-        if (!symbols.length) return
+        logEvent('INFO', 'Verificando credenciales con KuCoin...')
 
-        let alertsSent = 0
-        const CONCURRENCY = 3
-        const BATCH_DELAY = 10000
+        const balance = await kucoin.fetchBalance({ params: { type: 'main' } })
+        if (!balance.info?.data) throw new Error('Respuesta inválida de KuCoin')
 
-        for (let i = 0; i < symbols.length; i += CONCURRENCY) {
-            if (!isMonitoringActive) break
+        logEvent('INFO', 'Cargando mercados...')
+        const markets = await kucoin.loadMarkets(true)
 
-            const batch = symbols.slice(i, i + CONCURRENCY)
-            const results = await Promise.allSettled(batch.map(symbol => analyzeAndAlert(symbol)))
-            alertsSent += results.filter(r => r.status === 'fulfilled' && r.value).length
-
-            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
+        if (Object.keys(markets).length < 50) {
+            throw new Error(`Solo se cargaron ${Object.keys(markets).length} mercados`)
         }
 
-        botStats.cyclesCompleted++
-        logEvent('INFO', `Ciclo completado. Alertas: ${alertsSent}`)
+        const leverageTokens = Object.values(markets)
+            .filter(m => m.active && m.leveraged && m.quote === 'USDT')
+            .map(m => m.symbol)
+
+        logEvent('INFO', `Lista de tokens actualizada: ${leverageTokens.length} símbolos`)
+        return leverageTokens
+
     } catch (error) {
-        logEvent('ERROR', 'Error en monitorización', { error: error.stack })
-    } finally {
-        if (isMonitoringActive) setTimeout(monitorTokens, 300000)
+        logEvent('ERROR', 'Fallo en inicialización', {
+            error: error.stack,
+            lastRequest: kucoin.lastRequest,
+            lastResponse: kucoin.lastResponse
+        })
+        process.exit(1)
     }
 }
+
+async function monitorTokens() {
+    try {
+        const symbols = await initializeService() 
+        if (!symbols?.length) return
+
+        logEvent('INFO', `Iniciando análisis de ${symbols.length} tokens...`)
+
+        const BATCH_SIZE = 3
+        const BATCH_DELAY = 15000
+
+        for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
+            const batch = symbols.slice(i, i + BATCH_SIZE)
+            await Promise.allSettled(batch.map(symbol => analyzeAndAlert(symbol)))
+            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
+
+            const remaining = kucoin.lastResponseHeaders?.['x-ratelimit-remaining']
+            if (remaining < 10) {
+                const resetTime = parseInt(kucoin.lastResponseHeaders['x-ratelimit-reset'], 10)
+                const waitTime = Math.max(resetTime * 1000 - Date.now(), 0)
+                logEvent('WARN', `Rate limit alcanzado. Esperando ${waitTime}ms`)
+                await new Promise(resolve => setTimeout(resolve, waitTime))
+            }
+        }
+
+    } catch (error) {
+        logEvent('ERROR', 'Fallo catastrófico', { error: error.stack })
+        process.exit(1)
+    }
+}
+
 
 app.use(express.json())
 
@@ -322,6 +357,9 @@ setTimeout(() => {
     monitorTokens()
 }, 15000)
 
-app.listen(port, () => {
+app.listen(port, async () => {
     logEvent('INFO', `Servidor iniciado en puerto ${port}`)
+    setTimeout(() => {
+        monitorTokens().catch(() => process.exit(1))
+    }, 20000) 
 })
