@@ -48,24 +48,13 @@ async function startMonitoring() {
     const symbols = Object.keys(markets).filter(s => s.includes("3L/USDT") || s.includes("3S/USDT"))
 
     console.log("✅ Mercados cargados:", symbols.length)
+
     setInterval(async () => {
         if (!isMonitoring) return
 
         for (const symbol of symbols) {
-            const ohlcv = await kucoin.fetchOHLCV(symbol, '15m', undefined, 100)
-            const closes = ohlcv.map(c => c[4])
-            const rsi = ti.RSI.calculate({ values: closes, period: 14 }).pop()
-
-            if (rsi > 70 || rsi < 30) {
-                await axios.post(
-                    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-                    {
-                        chat_id: process.env.TELEGRAM_CHAT_ID,
-                        text: `ALERTA ${symbol}: RSI ${rsi.toFixed(2)}`
-                    }
-                )
-            }
-            await new Promise(r => setTimeout(r, 2000))
+            await analyzeSymbol(symbol);
+            await new Promise(r => setTimeout(r, 2000));
         }
     }, 300000)
 }
