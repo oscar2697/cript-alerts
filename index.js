@@ -148,8 +148,8 @@ function calculateIndicators(ohlcv) {
 
     return {
         lastClose: closes[closes.length - 1],
-        changePercent: ((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2] * 100,
-            ema9: ti.EMA.calculate({ period: 9, values: closes }).pop(),
+        changePercent: ((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2]) * 100,
+        ema9: ti.EMA.calculate({ period: 9, values: closes }).pop(),
         ema21: ti.EMA.calculate({ period: 21, values: closes }).pop(),
         rsi: ti.RSI.calculate({ period: 14, values: closes }).pop(),
         volumeAvg: ti.SMA.calculate({ period: 20, values: volumes }).pop()
