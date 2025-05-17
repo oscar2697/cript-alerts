@@ -13,18 +13,23 @@ const port = process.env.PORT || 3000
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN
 const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
-const kucoin = new ccxt.kucoin({
+const kucoinConfig = {
     enableRateLimit: true,
-    rateLimit: 10000,
-    timeout: 45000,
+    rateLimit: 15000,
+    timeout: 60000,
     apiKey: process.env.KUCOIN_API_KEY,
     secret: process.env.KUCOIN_API_SECRET,
     password: process.env.KUCOIN_API_PASSPHRASE,
     options: {
         adjustForTimeDifference: true,
-        recvWindow: 60000
+        recvWindow: 60000,
+        version: 'v2'
     }
-})
+}
+
+const kucoin = new ccxt.kucoin(kucoinConfig)
+
+let isServiceActive = false
 
 const tokenStates = new Map()
 let isMonitoringActive = false
@@ -53,6 +58,68 @@ async function saveLog(data) {
         logs.push({ timestamp: new Date().toISOString(), ...data })
         await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2))
     } catch (err) { }
+}
+
+async function verifyKuCoinConnection() {
+    try {
+        const response = await kucoin.fetchStatus()
+        
+        if (response.status !== 'ok') {
+            throw new Error(`Estado de API inesperado: ${response.status}`)
+        }
+
+        const serverTime = await kucoin.fetchTime()
+        const localTime = Date.now()
+        const timeDifference = Math.abs(serverTime - localTime)
+        
+        if (timeDifference > 5000) {
+            logEvent('WARN', `Diferencia temporal significativa: ${timeDifference}ms`)
+        }
+
+        return true
+    } catch (error) {
+        logEvent('ERROR', 'Fallo de conexión con KuCoin', {
+            error: error.message,
+            code: error.code,
+            url: kucoin.urls.api,
+            credentials: {
+                key: !!process.env.KUCOIN_API_KEY,
+                secret: !!process.env.KUCOIN_API_SECRET,
+                passphrase: !!process.env.KUCOIN_API_PASSPHRASE
+            }
+        })
+        return false
+    }
+}
+
+async function safeLoadMarkets() {
+    try {
+        const markets = await kucoin.loadMarkets(true)
+        
+        const requiredMarkets = [
+            'BTC3L/USDT',
+            'BTC3S/USDT',
+            'ETH3L/USDT',
+            'ETH3S/USDT'
+        ]
+        
+        const missingMarkets = requiredMarkets.filter(m => !markets[m])
+        if (missingMarkets.length > 0) {
+            throw new Error(`Mercados esenciales faltantes: ${missingMarkets.join(', ')}`)
+        }
+        
+        return Object.values(markets)
+            .filter(m => m.active && m.leveraged && m.quote === 'USDT')
+            .map(m => m.symbol)
+            
+    } catch (error) {
+        logEvent('ERROR', 'Error crítico en carga de mercados', {
+            error: error.message,
+            lastRequest: kucoin.lastRequest,
+            lastResponse: kucoin.lastResponse
+        })
+        process.exit(1)
+    }
 }
 
 function logEvent(type, message, data = {}) {
@@ -195,17 +262,23 @@ async function analyzeAndAlert(symbol) {
     }
 }
 
-async function initializeMarkets(retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            await kucoin.loadMarkets(true);
-            logEvent('INFO', 'Mercados cargados exitosamente');
-            return true;
-        } catch (error) {
-            if (i === retries - 1) throw error;
-            logEvent('WARN', `Reintentando carga de mercados (${i + 1}/${retries})`);
-            await new Promise(resolve => setTimeout(resolve, 10000 * (i + 1)));
-        }
+async function initializeService() {
+    if (!await verifyKuCoinConnection()) {
+        logEvent('ERROR', 'Verificación fallida: Revise sus credenciales y conexión')
+        process.exit(1)
+    }
+    
+    try {
+        const symbols = await safeLoadMarkets()
+        logEvent('INFO', `Inicialización exitosa. Símbolos cargados: ${symbols.length}`)
+        return symbols
+        
+    } catch (error) {
+        logEvent('ERROR', 'Fallo de inicialización crítica', {
+            error: error.stack,
+            environment: Object.keys(process.env).filter(k => k.startsWith('KUCOIN'))
+        })
+        process.exit(1)
     }
 }
 
@@ -359,7 +432,17 @@ setTimeout(() => {
 
 app.listen(port, async () => {
     logEvent('INFO', `Servidor iniciado en puerto ${port}`)
-    setTimeout(() => {
-        monitorTokens().catch(() => process.exit(1))
-    }, 20000) 
+    
+    setTimeout(async () => {
+        try {
+            await initializeService()
+            isServiceActive = true
+            monitorTokens()
+        } catch (error) {
+            logEvent('CRITICAL', 'Fallo de inicialización no recuperable', {
+                error: error.stack
+            })
+            process.exit(1)
+        }
+    }, 25000)
 })
