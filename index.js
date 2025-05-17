@@ -148,7 +148,10 @@ async function analyzeSymbol(symbol) {
             const alertMessage = `📈📉 *${symbol}*\n` +
                 `RSI: ${indicators.rsi.toFixed(2)} ${newState.sobrecompra ? '🔴' : '🟢'}\n` +
                 `Precio: ${indicators.lastClose.toFixed(4)} USDT\n` +
-                `Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
+                `Cambio 15m: ${indicators.changePercent.toFixed(2)}%\n\n` +
+                `${newState.sobrecompra
+                    ? "🔥 *Mercado sobrecalentado*\n✅ Recomendación: **VENDER**"
+                    : "❄️ *Mercado infravalorado*\n✅ Recomendación: **COMPRAR**"}`
 
             const success = await sendTelegramAlert(alertMessage)
             if (success) {
@@ -184,9 +187,6 @@ async function monitorCycle() {
         if (isServiceActive) setTimeout(monitorCycle, 300000)
     }
 }
-
-
-
 
 app.get('/status', (req, res) => res.json({
     ...botStats,
