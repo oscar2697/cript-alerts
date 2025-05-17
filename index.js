@@ -181,6 +181,15 @@ async function monitorCycle() {
     }
 }
 
+function startHeartbeat() {
+    setInterval(() => {
+        if (botStats.cyclesCompleted > 0 && botStats.totalAlertsSent === 0) {
+            logEvent('WARN', 'Heartbeat: Reiniciando monitorización')
+            monitorCycle();
+        }
+    }, 600000)
+}
+
 app.get('/status', (req, res) => res.json({
     ...botStats,
     lastSuccessfulAlert: tokenStates.size > 0 ?
@@ -213,4 +222,5 @@ app.get('/', (req, res) => res.send('Bot activo'))
 app.listen(port, () => {
     console.log(`🚀 Servidor operativo en puerto ${port}`)
     monitorCycle().catch(console.error)
+    startHeartbeat()
 })
