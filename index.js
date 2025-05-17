@@ -15,8 +15,8 @@ const telegramChatId = process.env.TELEGRAM_CHAT_ID
 
 const kucoinConfig = {
     enableRateLimit: true,
-    rateLimit: 15000,
-    timeout: 60000,
+    rateLimit: 20000,
+    timeout: 45000,
     apiKey: process.env.KUCOIN_API_KEY,
     secret: process.env.KUCOIN_API_SECRET,
     password: process.env.KUCOIN_API_PASSPHRASE,
@@ -30,10 +30,7 @@ const kucoinConfig = {
 const kucoin = new ccxt.kucoin(kucoinConfig)
 
 let isServiceActive = false
-
 const tokenStates = new Map()
-let isMonitoringActive = false
-
 const botStats = {
     startTime: new Date(),
     cyclesCompleted: 0,
@@ -46,42 +43,46 @@ const botStats = {
 
 const LOG_FILE = '/tmp/crypto-bot-logs.json'
 
+// --- Funciones mejoradas ---
 async function saveLog(data) {
     try {
-        let logs = []
-        try {
-            const existingData = await fs.readFile(LOG_FILE, 'utf8')
-            logs = JSON.parse(existingData)
-            if (logs.length >= 100) logs = logs.slice(-99)
-        } catch (err) { }
-
+        const logs = JSON.parse(await fs.readFile(LOG_FILE, 'utf8').slice(-99))
         logs.push({ timestamp: new Date().toISOString(), ...data })
         await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2))
-    } catch (err) { }
+    } catch (err) {
+        await fs.writeFile(LOG_FILE, JSON.stringify([data]))
+    }
+}
+
+function logEvent(type, message, data = {}) {
+    const entry = `[${new Date().toISOString()}] [${type}] ${message}`
+    console.log(entry)
+    saveLog({ type, message, ...data })
+
+    if (type === 'ERROR') {
+        botStats.errors.push({
+            timestamp: new Date().toISOString(),
+            message,
+            ...data
+        })
+        botStats.errors = botStats.errors.slice(-20)
+    }
 }
 
 async function verifyKuCoinConnection() {
     try {
-        const response = await kucoin.fetchStatus()
-        
-        if (response.status !== 'ok') {
-            throw new Error(`Estado de API inesperado: ${response.status}`)
-        }
+        const status = await kucoin.fetchStatus()
+        if (status.status !== 'ok') throw new Error('Estado API no ok')
 
         const serverTime = await kucoin.fetchTime()
-        const localTime = Date.now()
-        const timeDifference = Math.abs(serverTime - localTime)
-        
-        if (timeDifference > 5000) {
-            logEvent('WARN', `Diferencia temporal significativa: ${timeDifference}ms`)
-        }
+        const timeDiff = Math.abs(Date.now() - serverTime)
+        if (timeDiff > 5000) logEvent('WARN', `Diferencia temporal: ${timeDiff}ms`)
 
         return true
     } catch (error) {
-        logEvent('ERROR', 'Fallo de conexión con KuCoin', {
+        logEvent('ERROR', 'Fallo conexión KuCoin', {
             error: error.message,
             code: error.code,
-            url: kucoin.urls.api,
             credentials: {
                 key: !!process.env.KUCOIN_API_KEY,
                 secret: !!process.env.KUCOIN_API_SECRET,
@@ -95,288 +96,174 @@ async function verifyKuCoinConnection() {
 async function safeLoadMarkets() {
     try {
         const markets = await kucoin.loadMarkets(true)
-        
-        const requiredMarkets = [
-            'BTC3L/USDT',
-            'BTC3S/USDT',
-            'ETH3L/USDT',
-            'ETH3S/USDT'
-        ]
-        
-        const missingMarkets = requiredMarkets.filter(m => !markets[m])
-        if (missingMarkets.length > 0) {
-            throw new Error(`Mercados esenciales faltantes: ${missingMarkets.join(', ')}`)
-        }
-        
+
+        // Verificación de datos críticos
+        const requiredSymbols = ['BTC/USDT', 'ETH/USDT']
+        const missing = requiredSymbols.filter(s => !markets[s])
+        if (missing.length > 0) throw new Error(`Símbolos faltantes: ${missing.join(', ')}`)
+
         return Object.values(markets)
             .filter(m => m.active && m.leveraged && m.quote === 'USDT')
             .map(m => m.symbol)
-            
+
     } catch (error) {
-        logEvent('ERROR', 'Error crítico en carga de mercados', {
+        logEvent('ERROR', 'Fallo carga mercados', {
             error: error.message,
-            lastRequest: kucoin.lastRequest,
-            lastResponse: kucoin.lastResponse
+            lastRequest: kucoin.lastRequestUrl,
+            responseStatus: kucoin.lastResponseStatusCode
         })
         process.exit(1)
     }
 }
 
-function logEvent(type, message, data = {}) {
-    const logData = { type, message, ...data }
-    console.log(`[${new Date().toISOString()}] [${type}] ${message}`)
-    saveLog(logData)
-    if (type === 'ERROR') {
-        botStats.errors.push({ time: new Date().toISOString(), message, ...data })
-        if (botStats.errors.length > 20) botStats.errors.shift()
-    }
-}
+async function initializeService() {
+    if (!await verifyKuCoinConnection()) process.exit(1)
 
-async function getLeverageTokens() {
     try {
-        const markets = await kucoin.loadMarkets(true)
-        return Object.values(markets)
-            .filter(m =>
-                m.active !== false &&
-                m.leveraged === true &&
-                m.quote === 'USDT' &&
-                m.symbol.endsWith("3L/USDT") || m.symbol.endsWith("3S/USDT")
-            )
-            .map(m => m.symbol)
+        const symbols = await safeLoadMarkets()
+        logEvent('INFO', `Mercados cargados: ${symbols.length} símbolos`)
+        return symbols
     } catch (error) {
-        logEvent('ERROR', 'Fallo crítico al cargar mercados', {
-            error: error.message,
-            stack: error.stack,
-            apiStatus: kucoin.lastResponseHeaders ? kucoin.lastResponseHeaders['x-ratelimit-remaining'] : 'N/A'
-        });
-        return []
+        logEvent('CRITICAL', 'Fallo inicialización', { stack: error.stack })
+        process.exit(1)
     }
 }
 
 async function fetchWithRetry(symbol, retries = 3) {
-    for (let i = 0; i < retries; i++) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const ohlcv = await kucoin.fetchOHLCV(symbol, '15m', undefined, 100)
-            if (!ohlcv || ohlcv.length < 21) throw new Error('Datos insuficientes')
-            return ohlcv
+            if (ohlcv?.length >= 21) return ohlcv
+            throw new Error('Datos insuficientes')
         } catch (error) {
-            if (i === retries - 1) throw error
-            await new Promise(resolve => setTimeout(resolve, 5000 * (i + 1)))
+            if (attempt === retries) throw error
+            await new Promise(r => setTimeout(r, 5000 * attempt))
         }
     }
 }
 
 function calculateIndicators(ohlcv) {
-    try {
-        const close = ohlcv.map(c => c[4]).slice(-21)
-        const volume = ohlcv.map(c => c[5]).slice(-20)
+    const closes = ohlcv.slice(-21).map(c => c[4])
+    const volumes = ohlcv.slice(-20).map(c => c[5])
 
-        const ema9 = ti.EMA.calculate({ period: 9, values: close })
-        const ema21 = ti.EMA.calculate({ period: 21, values: close })
-        const rsi = ti.RSI.calculate({ period: 14, values: close })
-        const volumeAvg = ti.SMA.calculate({ period: 20, values: volume })
-
-        return {
-            lastClose: close[close.length - 1],
-            changePercent: ((close[close.length - 1] - close[close.length - 2]) / close[close.length - 2]) * 100,
-            ema9: ema9[ema9.length - 1],
-            ema21: ema21[ema21.length - 1],
-            rsi: rsi[rsi.length - 1],
-            volumeAvg: volumeAvg[volumeAvg.length - 1]
-        }
-    } catch (error) {
-        logEvent('ERROR', 'Error calculando indicadores', { error: error.stack })
-        return null
+    return {
+        lastClose: closes[closes.length - 1],
+        changePercent: ((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2] * 100,
+            ema9: ti.EMA.calculate({ period: 9, values: closes }).pop(),
+        ema21: ti.EMA.calculate({ period: 21, values: closes }).pop(),
+        rsi: ti.RSI.calculate({ period: 14, values: closes }).pop(),
+        volumeAvg: ti.SMA.calculate({ period: 20, values: volumes }).pop()
     }
 }
 
 async function sendTelegramAlert(message) {
-    const MAX_RETRIES = 3
-    for (let retry = 0; retry < MAX_RETRIES; retry++) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            const response = await axios.post(
+            const { data } = await axios.post(
                 `https://api.telegram.org/bot${telegramBotToken}/sendMessage`,
                 {
                     chat_id: telegramChatId,
-                    text: `${message}\n\n_Bot time: ${new Date().toISOString()}_`,
+                    text: `${message}\n\n_Actualizado: ${new Date().toISOString()}_`,
                     parse_mode: 'Markdown'
                 },
-                { timeout: 8000 }
+                { timeout: 10000 }
             )
-
-            if (response.data?.ok) {
-                botStats.lastSuccessfulAlert = new Date()
-                return { success: true }
-            }
+            if (data.ok) return true
         } catch (error) {
             if (error.response?.status === 429) {
-                const retryAfter = error.response.headers['retry-after'] || 15
-                await new Promise(resolve => setTimeout(resolve, retryAfter * 1000))
+                await new Promise(r => setTimeout(r, error.response.headers['retry-after'] * 1000 || 15000))
             }
+            if (attempt === 3) return false
+            await new Promise(r => setTimeout(r, 5000))
         }
-        await new Promise(resolve => setTimeout(resolve, 5000))
     }
-    return { success: false }
 }
 
 async function analyzeAndAlert(symbol) {
     try {
-        const start = Date.now()
         const ohlcv = await fetchWithRetry(symbol)
         const indicators = calculateIndicators(ohlcv)
-        if (!indicators) return false
 
-        const currentRsi = indicators.rsi
-        const lastState = tokenStates.get(symbol) || { sobrecompra: false, sobrevendido: false, lastAlert: 0 }
-
+        const lastState = tokenStates.get(symbol) || { sobrecompra: false, sobrevendido: false }
         const newState = {
-            sobrecompra: currentRsi > 70,
-            sobrevendido: currentRsi < 30,
+            sobrecompra: indicators.rsi > 70,
+            sobrevendido: indicators.rsi < 30,
             lastCheck: Date.now(),
-            rsi: currentRsi
+            rsi: indicators.rsi
         }
 
-        const shouldAlert = (newState.sobrecompra && !lastState.sobrecompra) ||
-            (newState.sobrevendido && !lastState.sobrevendido)
+        if ((newState.sobrecompra && !lastState.sobrecompra) ||
+            (newState.sobrevendido && !lastState.sobrevendido)) {
 
-        if (shouldAlert) {
-            const condition = newState.sobrecompra ? "SOBRECOMPRADO 🔴" : "SOBREVENDIDO 🟢"
-            const message = `${newState.sobrecompra ? "📉" : "📈"} *${symbol}* | ${condition}\n` +
-                `💰 Precio: ${indicators.lastClose.toFixed(4)} USDT\n` +
-                `📊 RSI: ${currentRsi.toFixed(2)}\n` +
-                `🔄 Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
+            const message = `${newState.sobrecompra ? '📉' : '📈'} *${symbol}*\n` +
+                `RSI: ${indicators.rsi.toFixed(2)} ${newState.sobrecompra ? '🔴' : '🟢'}\n` +
+                `Precio: ${indicators.lastClose.toFixed(4)} USDT\n` +
+                `Cambio 15m: ${indicators.changePercent.toFixed(2)}%`
 
-            const result = await sendTelegramAlert(message)
-            if (result.success) {
-                newState.lastAlert = Date.now()
+            const success = await sendTelegramAlert(message)
+            if (success) {
                 botStats.totalAlertsSent++
-                logEvent('INFO', `Alerta enviada: ${symbol}`)
+                newState.lastAlert = Date.now()
             }
             tokenStates.set(symbol, newState)
-            return result.success
+            return success
         }
         return false
     } catch (error) {
-        logEvent('ERROR', `Error analizando ${symbol}`, { error: error.stack })
+        logEvent('ERROR', `Error en ${symbol}`, { error: error.message })
         return false
-    }
-}
-
-async function initializeService() {
-    if (!await verifyKuCoinConnection()) {
-        logEvent('ERROR', 'Verificación fallida: Revise sus credenciales y conexión')
-        process.exit(1)
-    }
-    
-    try {
-        const symbols = await safeLoadMarkets()
-        logEvent('INFO', `Inicialización exitosa. Símbolos cargados: ${symbols.length}`)
-        return symbols
-        
-    } catch (error) {
-        logEvent('ERROR', 'Fallo de inicialización crítica', {
-            error: error.stack,
-            environment: Object.keys(process.env).filter(k => k.startsWith('KUCOIN'))
-        })
-        process.exit(1)
-    }
-}
-
-setTimeout(async () => {
-    try {
-        await initializeMarkets();
-        isMonitoringActive = true;
-        monitorTokens();
-    } catch (error) {
-        logEvent('ERROR', 'Fallo permanente al cargar mercados', {
-            error: error.stack,
-            action: 'Reiniciando servicio...'
-        });
-        process.exit(1);
-    }
-}, 15000);
-
-async function initializeService() {
-    try {
-        logEvent('INFO', 'Verificando credenciales con KuCoin...')
-
-        const balance = await kucoin.fetchBalance({ params: { type: 'main' } })
-        if (!balance.info?.data) throw new Error('Respuesta inválida de KuCoin')
-
-        logEvent('INFO', 'Cargando mercados...')
-        const markets = await kucoin.loadMarkets(true)
-
-        if (Object.keys(markets).length < 50) {
-            throw new Error(`Solo se cargaron ${Object.keys(markets).length} mercados`)
-        }
-
-        const leverageTokens = Object.values(markets)
-            .filter(m => m.active && m.leveraged && m.quote === 'USDT')
-            .map(m => m.symbol)
-
-        logEvent('INFO', `Lista de tokens actualizada: ${leverageTokens.length} símbolos`)
-        return leverageTokens
-
-    } catch (error) {
-        logEvent('ERROR', 'Fallo en inicialización', {
-            error: error.stack,
-            lastRequest: kucoin.lastRequest,
-            lastResponse: kucoin.lastResponse
-        })
-        process.exit(1)
     }
 }
 
 async function monitorTokens() {
     try {
-        const symbols = await initializeService() 
-        if (!symbols?.length) return
+        const symbols = await initializeService()
+        logEvent('INFO', `Iniciando monitoreo de ${symbols.length} tokens`)
 
-        logEvent('INFO', `Iniciando análisis de ${symbols.length} tokens...`)
-
-        const BATCH_SIZE = 3
-        const BATCH_DELAY = 15000
+        const BATCH_SIZE = 2
+        const BATCH_DELAY = 10000
 
         for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
             const batch = symbols.slice(i, i + BATCH_SIZE)
             await Promise.allSettled(batch.map(symbol => analyzeAndAlert(symbol)))
-            await new Promise(resolve => setTimeout(resolve, BATCH_DELAY))
 
-            const remaining = kucoin.lastResponseHeaders?.['x-ratelimit-remaining']
-            if (remaining < 10) {
-                const resetTime = parseInt(kucoin.lastResponseHeaders['x-ratelimit-reset'], 10)
-                const waitTime = Math.max(resetTime * 1000 - Date.now(), 0)
-                logEvent('WARN', `Rate limit alcanzado. Esperando ${waitTime}ms`)
-                await new Promise(resolve => setTimeout(resolve, waitTime))
+            const remaining = kucoin.lastResponseHeaders?.['x-ratelimit-remaining'] || 10
+            if (remaining < 5) {
+                const resetTime = parseInt(kucoin.lastResponseHeaders['x-ratelimit-reset'], 10) * 1000
+                const waitTime = Math.max(resetTime - Date.now(), 0)
+                logEvent('WARN', `Rate limit bajo. Esperando ${Math.round(waitTime / 1000)}s`)
+                await new Promise(r => setTimeout(r, waitTime))
             }
+
+            await new Promise(r => setTimeout(r, BATCH_DELAY))
         }
 
+        botStats.cyclesCompleted++
+        logEvent('INFO', `Ciclo completado. Próximo en 5m`)
+        setTimeout(monitorTokens, 300000)
+
     } catch (error) {
-        logEvent('ERROR', 'Fallo catastrófico', { error: error.stack })
+        logEvent('CRITICAL', 'Fallo en monitoreo', { error: error.stack })
         process.exit(1)
     }
 }
 
-
+// --- Endpoints ---
 app.use(express.json())
 
-app.get('/', (req, res) => {
-    res.json({
-        status: isMonitoringActive ? 'active' : 'inactive',
-        uptime: Math.floor(process.uptime())
-    })
-})
+app.get('/', (req, res) => res.json({
+    status: isServiceActive ? 'active' : 'inactive',
+    uptime: Math.floor(process.uptime())
+}))
 
-app.get('/status', (req, res) => {
-    res.json({
-        ...botStats,
-        lastSuccessfulAlert: botStats.lastSuccessfulAlert?.toISOString(),
-        startTime: botStats.startTime.toISOString()
-    })
-})
+app.get('/status', (req, res) => res.json({
+    ...botStats,
+    lastSuccessfulAlert: botStats.lastSuccessfulAlert?.toISOString(),
+    startTime: botStats.startTime.toISOString()
+}))
 
 app.post('/restart', (req, res) => {
-    isMonitoringActive = true
+    isServiceActive = true
     tokenStates.clear()
     Object.assign(botStats, {
         cyclesCompleted: 0,
@@ -390,59 +277,33 @@ app.post('/restart', (req, res) => {
     res.json({ status: 'restarting' })
 })
 
-app.get('/debug-auth', async (req, res) => {
-    try {
-        const response = await kucoin.fetchBalance();
-        res.json({
-            status: 'success',
-            account: response.info.data
-        });
-    } catch (error) {
-        res.status(500).json({
-            error: 'Fallo de autenticación',
-            details: error.message,
-            stack: error.stack
-        });
-    }
-});
-
-process.on('SIGTERM', () => {
-    isMonitoringActive = false
-    setTimeout(() => process.exit(0), 5000)
+// --- Manejo de procesos ---
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('uncaughtException', (err) => {
+    logEvent('CRITICAL', 'Excepción no capturada', { stack: err.stack })
+    shutdown('UNCAUGHT_EXCEPTION')
 })
-
-process.on('SIGINT', () => {
-    isMonitoringActive = false
-    setTimeout(() => process.exit(0), 5000)
-})
-
-process.on('uncaughtException', (error) => {
-    logEvent('ERROR', 'Excepción no capturada', { stack: error.stack })
-    setTimeout(() => process.exit(1), 10000)
-})
-
 process.on('unhandledRejection', (reason) => {
-    logEvent('ERROR', 'Promesa rechazada', { reason: reason.stack || reason })
+    logEvent('CRITICAL', 'Promesa rechazada', { reason: reason.stack || reason })
+    shutdown('UNHANDLED_REJECTION')
 })
 
-setTimeout(() => {
-    isMonitoringActive = true
-    monitorTokens()
-}, 15000)
+function shutdown(reason) {
+    logEvent('WARN', `Apagado iniciado (${reason})`)
+    isServiceActive = false
+    setTimeout(() => process.exit(0), 5000)
+}
 
-app.listen(port, async () => {
+// --- Inicialización ---
+app.listen(port, () => {
     logEvent('INFO', `Servidor iniciado en puerto ${port}`)
-    
-    setTimeout(async () => {
-        try {
-            await initializeService()
-            isServiceActive = true
-            monitorTokens()
-        } catch (error) {
-            logEvent('CRITICAL', 'Fallo de inicialización no recuperable', {
-                error: error.stack
+    setTimeout(() => {
+        initializeService()
+            .then(() => {
+                isServiceActive = true
+                monitorTokens()
             })
-            process.exit(1)
-        }
-    }, 25000)
+            .catch(() => process.exit(1))
+    }, 10000)
 })
