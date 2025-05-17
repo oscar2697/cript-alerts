@@ -8,17 +8,16 @@ const ti = require('technicalindicators')
 const fs = require('fs').promises
 
 const app = express()
-const port = process.env.PORT || 3000
+const port = process.env.PORT || 10000
 
 const kucoin = new ccxt.kucoin({
     enableRateLimit: true,
-    rateLimit: 20000,
-    timeout: 45000,
     apiKey: process.env.KUCOIN_API_KEY,
     secret: process.env.KUCOIN_API_SECRET,
-    password: process.env.KUCOIN_API_PASSPHRASE,
-    options: { adjustForTimeDifference: true, version: 'v2' }
+    password: process.env.KUCOIN_API_PASSPHRASE
 })
+
+let isMonitoring = true
 
 let isServiceActive = false
 const tokenStates = new Map()
@@ -41,6 +40,34 @@ async function logEvent(type, message, data = {}) {
             JSON.stringify({ timestamp, type, message, ...data }) + '\n'
         )
     } catch (err) { }
+}
+
+async function startMonitoring() {
+    console.log("🔄 Cargando mercados...")
+    const markets = await kucoin.loadMarkets()
+    const symbols = Object.keys(markets).filter(s => s.includes("3L/USDT") || s.includes("3S/USDT"))
+
+    console.log("✅ Mercados cargados:", symbols.length)
+    setInterval(async () => {
+        if (!isMonitoring) return
+
+        for (const symbol of symbols) {
+            const ohlcv = await kucoin.fetchOHLCV(symbol, '15m', undefined, 100)
+            const closes = ohlcv.map(c => c[4])
+            const rsi = ti.RSI.calculate({ values: closes, period: 14 }).pop()
+
+            if (rsi > 70 || rsi < 30) {
+                await axios.post(
+                    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+                    {
+                        chat_id: process.env.TELEGRAM_CHAT_ID,
+                        text: `ALERTA ${symbol}: RSI ${rsi.toFixed(2)}`
+                    }
+                )
+            }
+            await new Promise(r => setTimeout(r, 2000))
+        }
+    }, 300000)
 }
 
 async function loadMarketsWithRetry() {
@@ -158,6 +185,9 @@ async function monitorCycle() {
     }
 }
 
+
+
+
 app.get('/status', (req, res) => res.json({
     ...botStats,
     lastSuccessfulAlert: tokenStates.size > 0 ?
@@ -165,8 +195,12 @@ app.get('/status', (req, res) => res.json({
     activeSymbols: tokenStates.size
 }))
 
-process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => {
+    console.log("⚠️ Apagando servicio...")
+    isMonitoring = false
+    process.exit(0)
+})
 
 function shutdown(reason) {
     logEvent('INFO', `Apagado por ${reason}`)
@@ -174,8 +208,9 @@ function shutdown(reason) {
     setTimeout(() => process.exit(0), 5000)
 }
 
+app.get('/', (req, res) => res.send('Bot activo'))
+
 app.listen(port, () => {
-    logEvent('INFO', `Servidor iniciado en puerto ${port}`)
-    isServiceActive = true
-    monitorCycle()
-})
+    console.log(`🚀 Servidor operativo en puerto ${port}`)
+    startMonitoring().catch(console.error)
+});
