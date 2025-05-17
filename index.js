@@ -43,17 +43,25 @@ async function logEvent(type, message, data = {}) {
 }
 
 async function loadMarketsWithRetry() {
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 5; i++) {
         try {
             const markets = await kucoin.loadMarkets(true)
-            return Object.values(markets)
-                .filter(m => m.active && m.leveraged && m.quote === 'USDT')
-                .map(m => m.symbol)
+
+            console.log('Mercados cargados (ejemplos):', Object.keys(markets).slice(0, 3))
+
+            const leveragedSymbols = Object.values(markets).filter(m => {
+                const isLeveraged = m.leveraged || m.id.includes('3L') || m.id.includes('3S')
+                return m.active && isLeveraged && m.quote === 'USDT'
+            })
+
+            console.log('Símbolos filtrados:', leveragedSymbols.map(m => m.symbol))
+            return leveragedSymbols.map(m => m.symbol)
         } catch (error) {
-            if (i === 2) throw error
-            await new Promise(r => setTimeout(r, 10000 * (i + 1)))
+            logEvent('ERROR', `Intento ${i + 1}/5 fallido`, { error: error.message })
+            await new Promise(r => setTimeout(r, 15000 * (i + 1)))
         }
     }
+    throw new Error('Fallo permanente al cargar mercados')
 }
 
 async function fetchOHLCV(symbol) {
@@ -144,83 +152,87 @@ async function monitorCycle() {
         const symbols = await loadMarketsWithRetry()
         logEvent('INFO', `Iniciando ciclo con ${symbols.length} símbolos`)
 
-        tokenStates.clear()
-
-        let alertCount = 0
-
-        for (const symbol of symbols) {
-            if (!isServiceActive) break
-
-            try {
-                const alertSent = await analyzeSymbol(symbol)
-                if (alertSent) alertCount++
-            } catch (error) {
-                logEvent('ERROR', `Error procesando ${symbol}`, { error: error.message })
-            }
-
-            const remainingRequests = kucoin.lastResponseHeaders?.['x-ratelimit-remaining'] || 30
-            const resetTime = kucoin.lastResponseHeaders?.['x-ratelimit-reset']
-
-            if (remainingRequests < 5) {
-                const waitSeconds = Math.ceil((resetTime * 1000 - Date.now()) / 1000)
-                logEvent('WARN', `Rate limit crítico. Esperando ${waitSeconds}s`)
-                await new Promise(r => setTimeout(r, waitSeconds * 1000))
-            } else {
-                await new Promise(r => setTimeout(r, 1500))
-            }
+        if (symbols.length === 0) {
+            logEvent('CRITICAL', 'No se encontraron símbolos. Reiniciando...')
         }
 
-        botStats.cyclesCompleted++
-        logEvent('INFO', `Ciclo completado. Alertas enviadas: ${alertCount}`)
+            tokenStates.clear()
 
-        if (isServiceActive) setTimeout(monitorCycle, 300000)
+            let alertCount = 0
 
-    } catch (error) {
-        logEvent('CRITICAL', 'Error recuperable en ciclo', { error: error.message })
-        if (isServiceActive) setTimeout(monitorCycle, 60000)
+            for (const symbol of symbols) {
+                if (!isServiceActive) break
+
+                try {
+                    const alertSent = await analyzeSymbol(symbol)
+                    if (alertSent) alertCount++
+                } catch (error) {
+                    logEvent('ERROR', `Error procesando ${symbol}`, { error: error.message })
+                }
+
+                const remainingRequests = kucoin.lastResponseHeaders?.['x-ratelimit-remaining'] || 30
+                const resetTime = kucoin.lastResponseHeaders?.['x-ratelimit-reset']
+
+                if (remainingRequests < 5) {
+                    const waitSeconds = Math.ceil((resetTime * 1000 - Date.now()) / 1000)
+                    logEvent('WARN', `Rate limit crítico. Esperando ${waitSeconds}s`)
+                    await new Promise(r => setTimeout(r, waitSeconds * 1000))
+                } else {
+                    await new Promise(r => setTimeout(r, 1500))
+                }
+            }
+
+            botStats.cyclesCompleted++
+            logEvent('INFO', `Ciclo completado. Alertas enviadas: ${alertCount}`)
+
+            if (isServiceActive) setTimeout(monitorCycle, 300000)
+
+        } catch (error) {
+            logEvent('CRITICAL', 'Error recuperable en ciclo', { error: error.message })
+            if (isServiceActive) setTimeout(monitorCycle, 60000)
+        }
     }
-}
 
 function startHeartbeat() {
-    setInterval(() => {
-        if (botStats.cyclesCompleted > 0 && botStats.totalAlertsSent === 0) {
-            logEvent('WARN', 'Heartbeat: Reiniciando monitorización')
-            monitorCycle();
-        }
-    }, 600000)
-}
+        setInterval(() => {
+            if (botStats.cyclesCompleted > 0 && botStats.totalAlertsSent === 0) {
+                logEvent('WARN', 'Heartbeat: Reiniciando monitorización')
+                monitorCycle()
+            }
+        }, 600000)
+    }
 
-app.get('/status', (req, res) => res.json({
-    ...botStats,
-    lastSuccessfulAlert: tokenStates.size > 0 ?
-        new Date(Math.max(...Array.from(tokenStates.values()).map(s => s.lastAlert))) : null,
-    activeSymbols: tokenStates.size
-}))
+    app.get('/status', (req, res) => res.json({
+        ...botStats,
+        lastSuccessfulAlert: tokenStates.size > 0 ?
+            new Date(Math.max(...Array.from(tokenStates.values()).map(s => s.lastAlert))) : null,
+        activeSymbols: tokenStates.size
+    }))
 
-process.on('SIGINT', () => shutdown('SIGINT'))
-process.on('SIGTERM', () => {
-    console.log("⚠️ Apagando servicio...")
-    isMonitoring = false
-    process.exit(0)
-})
-
-function shutdown(reason) {
-    logEvent('INFO', `Apagado por ${reason}`)
-    isServiceActive = false
-    setTimeout(() => process.exit(0), 5000)
-}
-
-app.get('/debug/limits', (req, res) => {
-    res.json({
-        remaining: kucoin.lastResponseHeaders?.['x-ratelimit-remaining'],
-        reset: kucoin.lastResponseHeaders?.['x-ratelimit-reset']
+    process.on('SIGINT', () => shutdown('SIGINT'))
+    process.on('SIGTERM', () => {
+        console.log("⚠️ Apagando servicio...")
+        isMonitoring = false
+        process.exit(0)
     })
-})
 
-app.get('/', (req, res) => res.send('Bot activo'))
+    function shutdown(reason) {
+        logEvent('INFO', `Apagado por ${reason}`)
+        isServiceActive = false
+        setTimeout(() => process.exit(0), 5000)
+    }
 
-app.listen(port, () => {
-    console.log(`🚀 Servidor operativo en puerto ${port}`)
-    monitorCycle().catch(console.error)
-    startHeartbeat()
-})
+    app.get('/debug/limits', (req, res) => {
+        res.json({
+            remaining: kucoin.lastResponseHeaders?.['x-ratelimit-remaining'],
+            reset: kucoin.lastResponseHeaders?.['x-ratelimit-reset']
+        })
+    })
+
+    app.get('/', (req, res) => res.send('Bot activo'))
+
+    app.listen(port, () => {
+        console.log(`🚀 Servidor operativo en puerto ${port}`)
+        monitorCycle().catch(console.error)
+        startHeartbeat()
+    })
